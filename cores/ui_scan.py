@@ -22,6 +22,7 @@ import cores.ui_prompts as ui_prompts
 
 
 def prompt_target_ports():
+    ui_layout.draw_header(ui_mode="white")
     current_ports = ", ".join(str(p) for p in config.TARGET_PORTS)
     ui_layout.print_section("TARGET PORTS")
     print(f" [1] Use configured ports ({current_ports})")
@@ -193,6 +194,8 @@ def menu_scan():
     has_explicit_ports = any(_has_explicit_port(item) for item in expanded_items)
     strip_explicit_ports = False
     if has_explicit_ports:
+        ui_layout.draw_header(ui_mode="white")
+        ui_layout.print_section("EXPLICIT PORT TARGETS")
         strip_explicit_ports = ui_prompts.prompt_yes_no(
             "[?] Some targets include explicit ports. Strip them and scan only selected target ports",
             default=False,
@@ -240,8 +243,7 @@ def menu_scan():
         ui_layout.print_section("SCAN METHOD")
         ui_layout.print_hint(f"Target IPs queued: {len(base_ips)}")
 
-        print("\n [1] Normal scan (Python asyncio)")
-        print(f"     Accuracy-first, concurrency={config.MAX_CONCURRENT_SCANS}")
+        print(f"\n [1] Normal scan (asyncio, concurrency={config.MAX_CONCURRENT_SCANS})")
 
         if has_masscan:
             mass_option_num = [k for k, v in options.items() if v == "masscan"][0]

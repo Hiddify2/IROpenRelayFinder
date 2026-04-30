@@ -172,7 +172,10 @@ class _CursesConsole:
             self.stdscr.refresh()
             return
 
-        prompt_line = f"{prompt}{input_buffer}"
+        # Strip leading newlines — prompts use \n for spacing in plain terminals
+        # but in curses the bottom line is a single row.
+        clean_prompt = prompt.lstrip('\n')
+        prompt_line = f"{clean_prompt}{input_buffer}"
         content_rows = max(1, h - 2)
         max_offset = max(0, len(self.lines) - content_rows)
         self._scroll_offset = max(0, min(self._scroll_offset, max_offset))
@@ -288,79 +291,89 @@ class _CursesConsole:
                 self._append(f"{prompt}{value}\n")
                 self._draw_log()
                 return value
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
         buf = []
         selected_idx = 0
         selection_active = True
         default_initialized = False
-        while True:
-            current = "".join(buf)
-            choices = self._visible_choices()
-            if choices:
-                selected_idx = selected_idx % len(choices)
-            if choices and not default_initialized:
-                selected_idx = self._infer_default_choice_index(prompt, choices)
-                selection_active = True
-                default_initialized = True
+        try:
+            while True:
+                current = "".join(buf)
+                choices = self._visible_choices()
+                if choices:
+                    selected_idx = selected_idx % len(choices)
+                if choices and not default_initialized:
+                    selected_idx = self._infer_default_choice_index(prompt, choices)
+                    selection_active = True
+                    default_initialized = True
 
-            typed_row = self._find_row_for_buffer(current, choices)
-            selected_row = None
-            if typed_row is not None:
-                selected_row = typed_row
-            elif choices and selection_active:
-                selected_row = choices[selected_idx][0]
+                typed_row = self._find_row_for_buffer(current, choices)
+                selected_row = None
+                if typed_row is not None:
+                    selected_row = typed_row
+                elif choices and selection_active:
+                    selected_row = choices[selected_idx][0]
 
-            self._draw_log(prompt=prompt, input_buffer=current, selected_row=selected_row)
-            key = self.stdscr.getch()
+                self._draw_log(prompt=prompt, input_buffer=current, selected_row=selected_row)
+                key = self.stdscr.getch()
 
-            if key in (10, 13, curses.KEY_ENTER):
-                if self._is_choice_prompt(prompt) and selection_active and choices and not buf:
-                    value = choices[selected_idx][1]
+                if key in (10, 13, curses.KEY_ENTER):
+                    if self._is_choice_prompt(prompt) and selection_active and choices and not buf:
+                        value = choices[selected_idx][1]
+                        self._append(f"{prompt}{value}\n")
+                        self._draw_log()
+                        return value
+                    value = "".join(buf)
                     self._append(f"{prompt}{value}\n")
                     self._draw_log()
                     return value
-                value = "".join(buf)
-                self._append(f"{prompt}{value}\n")
-                self._draw_log()
-                return value
-            if key in (curses.KEY_BACKSPACE, 127, 8):
-                if buf:
-                    buf.pop()
-                if not buf:
-                    selection_active = True
-                continue
-            if key in (curses.KEY_UP,):
-                if choices:
-                    selected_idx = (selected_idx - 1) % len(choices)
-                    selection_active = True
-                continue
-            if key in (curses.KEY_DOWN, 9):
-                if choices:
-                    selected_idx = (selected_idx + 1) % len(choices)
-                    selection_active = True
-                continue
-            if key in (curses.KEY_PPAGE,):
-                self._scroll_offset += max(1, self.stdscr.getmaxyx()[0] - 3)
-                continue
-            if key in (curses.KEY_NPAGE, curses.KEY_END):
-                self._scroll_offset = max(0, self._scroll_offset - max(1, self.stdscr.getmaxyx()[0] - 3))
-                continue
-            if key == curses.KEY_HOME:
-                self._scroll_offset = max(0, len(self.lines))
-                continue
-            if key in (27, curses.KEY_RESIZE):
-                continue
-            if key == curses.KEY_MOUSE:
-                selected = self._handle_mouse_choice()
-                if selected is not None:
-                    self._append(f"{prompt}{selected}\n")
-                    self._draw_log()
-                    return selected
-                continue
-            if 0 <= key <= 255:
-                ch = chr(key)
-                if ch.isprintable():
-                    buf.append(ch)
-                    selection_active = True
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    if buf:
+                        buf.pop()
+                    if not buf:
+                        selection_active = True
+                    continue
+                if key in (curses.KEY_UP,):
+                    if choices:
+                        selected_idx = (selected_idx - 1) % len(choices)
+                        selection_active = True
+                    continue
+                if key in (curses.KEY_DOWN, 9):
+                    if choices:
+                        selected_idx = (selected_idx + 1) % len(choices)
+                        selection_active = True
+                    continue
+                if key in (curses.KEY_PPAGE,):
+                    self._scroll_offset += max(1, self.stdscr.getmaxyx()[0] - 3)
+                    continue
+                if key in (curses.KEY_NPAGE, curses.KEY_END):
+                    self._scroll_offset = max(0, self._scroll_offset - max(1, self.stdscr.getmaxyx()[0] - 3))
+                    continue
+                if key == curses.KEY_HOME:
+                    self._scroll_offset = max(0, len(self.lines))
+                    continue
+                if key in (27, curses.KEY_RESIZE):
+                    continue
+                if key == curses.KEY_MOUSE:
+                    selected = self._handle_mouse_choice()
+                    if selected is not None:
+                        self._append(f"{prompt}{selected}\n")
+                        self._draw_log()
+                        return selected
+                    continue
+                if 0 <= key <= 255:
+                    ch = chr(key)
+                    if ch.isprintable():
+                        buf.append(ch)
+                        selection_active = True
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
 
     def _patched_clear_screen(self):
         self.lines = []
@@ -466,24 +479,34 @@ class _CursesConsole:
         )
 
     def _capture_text_input_box(self, prompt):
-        buf = []
-        while True:
-            self._draw_text_input_box(prompt, "".join(buf))
-            key = self.stdscr.getch()
-            if key in (10, 13, curses.KEY_ENTER):
-                return "".join(buf)
-            if key in (curses.KEY_BACKSPACE, 127, 8):
-                if buf:
-                    buf.pop()
-                continue
-            if key in (27, curses.KEY_RESIZE):
-                continue
-            if key == curses.KEY_MOUSE:
-                continue
-            if 0 <= key <= 255:
-                ch = chr(key)
-                if ch.isprintable():
-                    buf.append(ch)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            buf = []
+            while True:
+                self._draw_text_input_box(prompt, "".join(buf))
+                key = self.stdscr.getch()
+                if key in (10, 13, curses.KEY_ENTER):
+                    return "".join(buf)
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    if buf:
+                        buf.pop()
+                    continue
+                if key in (27, curses.KEY_RESIZE):
+                    continue
+                if key == curses.KEY_MOUSE:
+                    continue
+                if 0 <= key <= 255:
+                    ch = chr(key)
+                    if ch.isprintable():
+                        buf.append(ch)
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
 
     def _draw_text_input_box(self, prompt, current):
         h, w = self.stdscr.getmaxyx()
