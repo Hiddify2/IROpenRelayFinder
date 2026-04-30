@@ -1,0 +1,724 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>راهنمای کامل White Proxy (آفلاین)</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --bg-soft: #121a33;
+      --card: #141f3d;
+      --text: #e8eeff;
+      --muted: #b8c4ef;
+      --accent: #7aa2ff;
+      --accent-2: #80ffd5;
+      --warn: #ffd27a;
+      --ok: #9dff9c;
+      --danger: #ff9ca7;
+      --border: #2a3763;
+      --code: #0f1731;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: linear-gradient(180deg, var(--bg), #090d1a 60%);
+      color: var(--text);
+      font-family: Tahoma, "Noto Naskh Arabic", "Vazirmatn", "Segoe UI", sans-serif;
+      line-height: 1.9;
+    }
+
+    a { color: var(--accent-2); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .wrap {
+      width: min(1120px, 96vw);
+      margin: 24px auto 60px;
+      display: grid;
+      grid-template-columns: 300px 1fr;
+      gap: 20px;
+    }
+
+    .toc {
+      position: sticky;
+      top: 14px;
+      height: calc(100vh - 28px);
+      overflow: auto;
+      background: rgba(18, 26, 51, 0.7);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      backdrop-filter: blur(6px);
+    }
+
+    .toc h2 {
+      margin: 0 0 10px;
+      font-size: 1.02rem;
+      color: var(--accent-2);
+    }
+
+    .toc ul { list-style: none; padding: 0; margin: 0; }
+    .toc li { margin: 6px 0; }
+    .toc .sub { padding-right: 12px; opacity: 0.92; }
+
+    .content {
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    section {
+      background: rgba(20, 31, 61, 0.7);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+    }
+
+    h1, h2, h3 {
+      margin-top: 0;
+      line-height: 1.5;
+    }
+
+    h1 {
+      font-size: 1.7rem;
+      margin-bottom: 10px;
+      color: #dbe7ff;
+    }
+
+    h2 {
+      font-size: 1.25rem;
+      color: var(--accent);
+      margin-bottom: 10px;
+    }
+
+    h3 {
+      font-size: 1.04rem;
+      color: #c8d8ff;
+      margin-bottom: 8px;
+    }
+
+    p, li { color: var(--text); }
+    .muted { color: var(--muted); }
+
+    .badge {
+      display: inline-block;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 2px 10px;
+      font-size: 0.84rem;
+      margin: 0 0 6px 6px;
+      color: #d7e4ff;
+      background: #101934;
+    }
+
+    .warn, .note, .ok, .danger {
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin: 10px 0;
+      border: 1px solid var(--border);
+      background: #101935;
+    }
+
+    .warn { border-right: 5px solid var(--warn); }
+    .ok { border-right: 5px solid var(--ok); }
+    .danger { border-right: 5px solid var(--danger); }
+    .note { border-right: 5px solid var(--accent); }
+
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      direction: ltr;
+      text-align: left;
+    }
+
+    pre {
+      margin: 10px 0;
+      padding: 12px;
+      overflow-x: auto;
+      border-radius: 10px;
+      background: var(--code);
+      border: 1px solid #29396e;
+      color: #d8e5ff;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 0.95rem;
+    }
+
+    th, td {
+      border: 1px solid #31457f;
+      padding: 9px 10px;
+      vertical-align: top;
+    }
+
+    th {
+      background: #12204b;
+      color: #d9e6ff;
+    }
+
+    td { background: rgba(13, 22, 48, 0.74); }
+
+    .pipeline {
+      margin: 8px 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: s;
+    }
+
+    .pipeline li {
+      margin: 8px 0;
+      padding: 8px 12px;
+      border: 1px dashed #3d5396;
+      border-radius: 10px;
+      background: rgba(18, 28, 58, 0.8);
+      position: relative;
+    }
+
+    .pipeline li::before {
+      counter-increment: s;
+      content: counter(s);
+      display: inline-flex;
+      width: 22px;
+      height: 22px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      background: #29438c;
+      color: white;
+      margin-left: 8px;
+      font-size: 0.82rem;
+      border: 1px solid #5f7ecf;
+    }
+
+    .small { font-size: 0.92rem; }
+
+    @media (max-width: 980px) {
+      .wrap { grid-template-columns: 1fr; }
+      .toc {
+        position: relative;
+        top: 0;
+        height: auto;
+        max-height: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <nav class="toc" aria-label="فهرست مطالب">
+      <h2>فهرست راهنما</h2>
+      <ul>
+        <li><a href="#intro">1) مقدمه و هدف</a></li>
+        <li><a href="#quickstart">2) راه‌اندازی سریع</a></li>
+        <li class="sub"><a href="#v2ray">2.1 تنظیم V2Ray/Xray روی 127.0.0.1:7080</a></li>
+        <li><a href="#main-menu">3) توضیح کامل منوی اصلی</a></li>
+        <li><a href="#scan-menu">4) منوی Scan Targets</a></li>
+        <li><a href="#dpi-menu">5) منوی DPI Strategies</a></li>
+        <li><a href="#tools-menu">6) منوی Tools و Inspect</a></li>
+        <li><a href="#modes">7) مودها: White / Desync / Mixed</a></li>
+        <li class="sub"><a href="#pipeline-white">7.1 پایپلاین White Routing</a></li>
+        <li class="sub"><a href="#pipeline-desync">7.2 پایپلاین DPI Desync</a></li>
+        <li class="sub"><a href="#pipeline-mixed">7.3 پایپلاین Mixed</a></li>
+        <li><a href="#advanced-cores">8) ابزارهای پیشرفته (s/c/a)</a></li>
+        <li class="sub"><a href="#desync-scanner">8.1 Desync Scanner</a></li>
+        <li class="sub"><a href="#sni-scanner">8.2 SNI Scanner</a></li>
+        <li class="sub"><a href="#autotuner">8.3 Auto-Tuner</a></li>
+        <li><a href="#hidden">9) قابلیت‌های پنهان و Passive</a></li>
+        <li><a href="#files">10) فایل‌ها و داده‌های خروجی</a></li>
+        <li><a href="#architecture">11) معماری فنی (Whitepaper)</a></li>
+        <li><a href="#troubleshoot">12) عیب‌یابی دقیق</a></li>
+        <li><a href="#safety">13) نکات امنیتی/عملیاتی</a></li>
+      </ul>
+    </nav>
+
+    <main class="content">
+      <section id="intro">
+        <h1>راهنمای جامع White Proxy (نسخه آفلاین فارسی)</h1>
+        <span class="badge">Linux-first</span>
+        <span class="badge">Stdlib-only (بدون پکیج پایتون)</span>
+        <span class="badge">Offline قابل مشاهده</span>
+
+        <p>
+          این سند یک راهنمای کامل و فنی برای استفاده از پروژه <strong>White Proxy</strong> است: از اجرای اولیه،
+          ساخت IP Pool، اجرای مودهای مختلف، اتصال V2Ray/Xray روی <strong>127.0.0.1:7080</strong>،
+          تا توضیح ریزپایپلاین‌ها و رفتارهای پنهان/پس‌زمینه.
+        </p>
+
+        <div class="note">
+          این سند بر اساس کد فعلی پروژه نوشته شده است و تمام منوها، گزینه‌ها، فایل‌های خروجی،
+          و منطق داخلی مهم را پوشش می‌دهد.
+        </div>
+      </section>
+
+      <section id="quickstart">
+        <h2>2) راه‌اندازی سریع</h2>
+
+        <h3>پیش‌نیازها</h3>
+        <ul>
+          <li>پایتون 3.9 یا جدیدتر</li>
+          <li>برای برخی مسیرها دسترسی <code>sudo/root</code> (به‌خصوص DPI خام و برخی Preflight)</li>
+          <li>اختیاری: <code>masscan</code> و <code>nmap</code> برای اسکن سریع‌تر</li>
+        </ul>
+
+        <h3>اجرای برنامه</h3>
+        <pre>python main.py</pre>
+
+        <h3>ترتیب پیشنهادی استفاده روزمره</h3>
+        <ol>
+          <li>از منو <strong>[1]</strong> اسکن بگیر و IP Pool بساز</li>
+          <li>در صورت نیاز <strong>[7]</strong> استراتژی DPI را تنظیم کن</li>
+          <li>با <strong>[w]</strong> یا <strong>[d]</strong> یا <strong>[m]</strong> پروکسی را بالا بیاور</li>
+          <li>کلاینت‌ها (مرورگر/سیستم/V2Ray) را به <code>127.0.0.1:7080</code> وصل کن</li>
+          <li>برای مشکلات دامنه‌ای از <strong>[6]</strong> (reroute + ban domain-specific) استفاده کن</li>
+        </ol>
+
+        <div class="warn">
+          در Linux اگر مود DPI را اجرا می‌کنید و موتور raw socket نیاز باشد، برنامه تلاش می‌کند با sudo اجرا شود.
+        </div>
+      </section>
+
+      <section id="v2ray">
+        <h2>2.1 تنظیم V2Ray/Xray برای Desync با آدرس 127.0.0.1 و پورت 7080</h2>
+        <p>
+          با توجه به اینکه شما کانفیگ‌های Cloudflare Worker را در V2Ray/Xray دارید،
+          کافی‌ست خروجی/ارتباطی که باید از این پروکسی عبور کند را به لوکال پراکسی وصل کنید:
+          <strong>Address = 127.0.0.1</strong> و <strong>Port = 7080</strong>.
+        </p>
+
+        <h3>دو الگوی رایج اتصال</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>الگو</th>
+              <th>توضیح</th>
+              <th>چه زمانی مناسب است</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>HTTP/SOCKS Proxy Chain</td>
+              <td>V2Ray/Xray یا سیستم‌عامل را طوری تنظیم می‌کنید که درخواست‌ها به <code>127.0.0.1:7080</code> بروند.</td>
+              <td>وقتی می‌خواهید همه/بخشی از ترافیک از White Proxy عبور کند.</td>
+            </tr>
+            <tr>
+              <td>Transparent TLS Path</td>
+              <td>White Proxy بایت اول TLS را تشخیص می‌دهد (مسیر Transparent TLS برای V2Ray/Xray).</td>
+              <td>برای سناریوهایی که ترافیک TLS به شکل شفاف به پروکسی می‌رسد.</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <h3>چک‌لیست سریع</h3>
+        <ul>
+          <li>White Proxy را با <strong>[d]</strong> یا <strong>[m]</strong> بالا بیاور.</li>
+          <li>در کلاینت خود upstream را روی <code>127.0.0.1:7080</code> بگذار.</li>
+          <li>اگر نیاز به DPI injection داری، از منوی <strong>[7]</strong> استراتژی را انتخاب کن.</li>
+          <li>در Mixed، ترافیک 443 می‌تواند مسیر DPI بگیرد و بقیه/وب عمومی از White Pool استفاده کند.</li>
+        </ul>
+
+        <div class="ok">
+          پروکسی روی چند پروتکل کار می‌کند: SOCKS5، HTTP/HTTPS، و Transparent TLS.
+        </div>
+      </section>
+
+      <section id="main-menu">
+        <h2>3) توضیح کامل منوی اصلی</h2>
+        <p class="muted">منوی اصلی از سه بخش Setup، Launch و Tools تشکیل شده است.</p>
+
+        <table>
+          <thead>
+            <tr>
+              <th>کلید</th>
+              <th>گزینه</th>
+              <th>کارکرد دقیق</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>1</td><td>Scan Targets and Build IP Pool</td><td>اسکن هدف‌ها، ارزیابی IPها، ذخیره فایل نتیجه، و بارگذاری بهترین‌ها در Pool.</td></tr>
+            <tr><td>2</td><td>Reload IP Pool from Latest Scan</td><td>آخرین فایل scan را بارگذاری می‌کند (بدون اجرای اسکن جدید).</td></tr>
+            <tr><td>3</td><td>Instant Connect</td><td>بدون اسکن، IPها را مستقیم وارد Pool می‌کند (برای شروع سریع).</td></tr>
+            <tr><td>4</td><td>Change Proxy Port</td><td>پورت لوکال پراکسی را تغییر می‌دهد.</td></tr>
+            <tr><td>5</td><td>Clear Routing Cache</td><td>فایل route cache را پاک می‌کند تا race مجدد برای دامنه‌ها انجام شود.</td></tr>
+            <tr><td>6</td><td>Force Reroute Domain and Ban IP</td><td>مسیر فعلی دامنه را حذف می‌کند و IP خراب را فقط برای همان دامنه ban می‌کند.</td></tr>
+            <tr><td>7</td><td>Configure DPI Desync Strategies</td><td>انتخاب/ترکیب استراتژی‌های desync و گزینه‌های جانبی DPI.</td></tr>
+            <tr><td>w</td><td>Start Proxy (White Routing)</td><td>مود white_ip؛ مسیر اصلی race+cache بدون desync خام.</td></tr>
+            <tr><td>d</td><td>Start Proxy (DPI Desync)</td><td>مود desync؛ مسیر 443 با inject/split مطابق استراتژی.</td></tr>
+            <tr><td>m</td><td>Start Proxy (Mixed)</td><td>مود ترکیبی: مزایای White + DPI با رفتار تفکیکی.</td></tr>
+            <tr><td>s</td><td>Scan/Mine DPI SNI Pairs</td><td>استخراج و اعتبارسنجی جفت‌های SNI/IP و ذخیره در desync_pairs.</td></tr>
+            <tr><td>c</td><td>SNI Scanner</td><td>کشف SNIهای clean روی IPهای Cloudflare.</td></tr>
+            <tr><td>a</td><td>Auto-Tune Scan Rates</td><td>تنظیم خودکار concurrency/rate برای اسکن‌ها متناسب با شبکه شما.</td></tr>
+            <tr><td>i</td><td>Inspect IPs (ASN and Type)</td><td>نمایش ASN/ISP/نوع برای Pool، Cache، یا لیست دلخواه.</td></tr>
+            <tr><td>0</td><td>Exit</td><td>خروج کامل از رابط.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="scan-menu">
+        <h2>4) منوی Scan Targets and Build IP Pool</h2>
+
+        <h3>منابع ورودی اسکن</h3>
+        <table>
+          <thead><tr><th>گزینه</th><th>توضیح</th></tr></thead>
+          <tbody>
+            <tr><td>[1] فایل</td><td>خواندن IP/CIDR/ASN از فایل دلخواه</td></tr>
+            <tr><td>[2] دستی</td><td>Paste مستقیم IP/CIDR/ASN</td></tr>
+            <tr><td>[3] White Cache</td><td>اسکن مجدد IPهای کش دائمی</td></tr>
+            <tr><td>[4] Cloudflare CNAME mining</td><td>استخراج IP از CNAMEهای Cloudflare طی چند دور DNS</td></tr>
+            <tr><td>[5] IranASN DB</td><td>انتخاب ASN از دیتابیس و اسکن subnetها</td></tr>
+          </tbody>
+        </table>
+
+        <h3>Preflight (اختیاری)</h3>
+        <ul>
+          <li><strong>Normal</strong>: مسیر asyncio داخلی (دقت بالا)</li>
+          <li><strong>Masscan</strong>: خیلی سریع، معمولاً نیازمند sudo</li>
+          <li><strong>Nmap</strong>: قابل تنظیم با timing/retries/rates و مدل SYN یا Connect</li>
+        </ul>
+
+        <h3>Cyclic Continuous Scan</h3>
+        <p>
+          در حالت Cyclic، اسکن به‌صورت دوری ادامه دارد، نتایج تجمیع می‌شوند،
+          در <code>scan_cyclic_continuous.json</code> ذخیره می‌گردند و هر دور در archive جداگانه ثبت می‌شود.
+        </p>
+
+        <h3>پایپلاین اسکن</h3>
+        <ol class="pipeline">
+          <li>Expand ورودی‌ها (IP/CIDR/ASN → لیست IP)</li>
+          <li>انتخاب روش Preflight (اختیاری)</li>
+          <li>TLS probe و HTTP probe روی دامنه‌های مرجع</li>
+          <li>Classification پاسخ: accept / soft_accept / reject / dead</li>
+          <li>مرتب‌سازی بر اساس score و latency</li>
+          <li>ذخیره فایل scan و نگه‌داشتن فقط چند فایل آخر</li>
+          <li>بارگذاری Top IPها در Dynamic Pool</li>
+          <li>افزودن IPهای جدید به white_ips_cache</li>
+        </ol>
+
+        <div class="note">
+          soft_accept (معمولاً Cloudflare Worker IP با محدودیت AI) حذف نمی‌شود؛
+          برای دامنه‌های مشکل‌دار auto-ban می‌شود ولی برای ترافیک عمومی می‌تواند در pool بماند.
+        </div>
+      </section>
+
+      <section id="dpi-menu">
+        <h2>5) منوی Configure DPI Desync Strategies</h2>
+
+        <h3>گزینه‌های منو</h3>
+        <ul>
+          <li><code>f</code>: روشن/خاموش کردن TCP Fragmentation</li>
+          <li><code>l</code>: روشن/خاموش کردن نمایش دائمی لاگ DPI</li>
+          <li><code>1..7</code>: انتخاب استراتژی‌ها</li>
+          <li><code>d</code>: ذخیره و خروج</li>
+        </ul>
+
+        <h3>استراتژی‌ها</h3>
+        <table>
+          <thead><tr><th>شناسه</th><th>مفهوم فنی</th></tr></thead>
+          <tbody>
+            <tr><td>oob</td><td>ارسال packet جعلی با sequence خارج از پنجره</td></tr>
+            <tr><td>bad_csum</td><td>packet جعلی با checksum خراب</td></tr>
+            <tr><td>ttl</td><td>کاهش TTL تا packet جعلی قبل از CDN منقضی شود</td></tr>
+            <tr><td>syn</td><td>تزریق SYN جعلی</td></tr>
+            <tr><td>rst</td><td>تزریق RST جعلی</td></tr>
+            <tr><td>fin</td><td>تزریق FIN جعلی</td></tr>
+            <tr><td>classic</td><td>بدون fake packet؛ فقط تکیه بر chunking/splitting</td></tr>
+          </tbody>
+        </table>
+
+        <div class="warn">
+          انتخاب چند استراتژی باعث Auto-rotation می‌شود و اگر شکست‌های DPI تکرار شود،
+          سیستم به‌صورت خودکار بین استراتژی‌ها جابجا می‌شود.
+        </div>
+      </section>
+
+      <section id="tools-menu">
+        <h2>6) منوی Tools: Reroute و Inspect</h2>
+
+        <h3>[6] Force Reroute Domain and Ban IP</h3>
+        <p>
+          این گزینه route فعلی دامنه را (exact/wildcard) حذف می‌کند،
+          IP خراب را فقط برای همان <strong>base domain</strong> ban می‌کند،
+          و با مراجعه بعدی دامنه، race جدید را مجبور می‌کند.
+        </p>
+
+        <h3>[i] Inspect IPs</h3>
+        <ul>
+          <li>مشاهده ASN/ISP/TYPE برای IPهای Dynamic Pool</li>
+          <li>مشاهده برای Permanent White Cache</li>
+          <li>ورودی سفارشی (فایل یا دستی)</li>
+          <li>مرور دیتابیس کامل ASN</li>
+        </ul>
+      </section>
+
+      <section id="modes">
+        <h2>7) مودها: White Routing / DPI Desync / Mixed</h2>
+
+        <table>
+          <thead><tr><th>مود</th><th>رفتار اصلی</th><th>بهترین کاربرد</th></tr></thead>
+          <tbody>
+            <tr><td>white_ip</td><td>routing مبتنی بر race + cache روی IP pool</td><td>پایداری بالا و مصرف CPU متعادل</td></tr>
+            <tr><td>dpi_desync</td><td>تزریق/fragmentation برای ترافیک 443</td><td>وقتی DPI تهاجمی است و مسیر عادی کافی نیست</td></tr>
+            <tr><td>mixed</td><td>ترکیب رفتارهای White و Desync</td><td>سناریوهای هیبرید (خصوصاً V2Ray + وب)</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="pipeline-white">
+        <h2>7.1 پایپلاین White Routing (جزئیات کامل)</h2>
+        <ol class="pipeline">
+          <li>کلاینت متصل می‌شود (SOCKS5/HTTP/Transparent TLS).</li>
+          <li>target host/port استخراج می‌شود.</li>
+          <li>برای دامنه‌های .ir مسیر native مستقیم اعمال می‌شود.</li>
+          <li>ابتدا exact/wildcard cache بررسی می‌گردد.</li>
+          <li>اگر cache hit باشد ولی IP برای آن دامنه ban باشد، race اجباری می‌شود.</li>
+          <li>race همزمان روی target مستقیم + IPهای pool انجام می‌شود (با semaphore).</li>
+          <li>برنده ثبت/کش می‌شود (برای دامنه‌های غیر-video shard).</li>
+          <li>در شکست کامل، دامنه به failed log می‌رود و برای TLS می‌تواند 502 برگردد تا خطای cert ظاهر نشود.</li>
+        </ol>
+
+        <h3>نکات عمیق</h3>
+        <ul>
+          <li>برای دامنه‌های حساس (AI/Google/CDN)، verify_sni سخت‌گیرانه‌تر است (cert + probe).</li>
+          <li>duplicate race برای یک host با race lock جلوگیری می‌شود.</li>
+          <li>fallback race روی banned IPها در صورت شکست primary می‌تواند فعال شود.</li>
+          <li>برای <code>turns.goog</code> fallback alias با SNI گوگل وجود دارد.</li>
+        </ul>
+      </section>
+
+      <section id="pipeline-desync">
+        <h2>7.2 پایپلاین DPI Desync (جزئیات کامل)</h2>
+        <ol class="pipeline">
+          <li>مود desync یا mixed فعال می‌شود.</li>
+          <li>هدف SNI/IP از desync_pairs یا ورودی دستی انتخاب می‌شود.</li>
+          <li>موتور DPI بر اساس سیستم‌عامل بالا می‌آید (Linux raw socket / Windows WinDivert).</li>
+          <li>در handshake، seq/ack اتصال مانیتور می‌شود.</li>
+          <li>ClientHello جعلی با SNI spoof تزریق می‌گردد (یا classic فقط split).</li>
+          <li>سپس مسیر واقعی relay ادامه پیدا می‌کند.</li>
+          <li>در شکست‌های سریع پیاپی، auto-rotation استراتژی رخ می‌دهد.</li>
+        </ol>
+
+        <div class="note">
+          لاگ‌های DPI بعد از 10 ثانیه اول startup به‌صورت خودکار کم می‌شوند (مگر اینکه گزینه همیشه‌نمایش فعال باشد) تا CPU تحت فشار نرود.
+        </div>
+      </section>
+
+      <section id="pipeline-mixed">
+        <h2>7.3 پایپلاین Mixed</h2>
+        <p>
+          در Mixed، منطق White Routing و Desync همزمان فعال هستند:
+          مسیرهای وب/دامنه‌های عمومی می‌توانند از race+pool سود ببرند و مسیرهای TLS هدف‌دار
+          از desync engine استفاده کنند.
+        </p>
+
+        <ul>
+          <li>prewarm/passive/health workers فعال می‌مانند (مثل white_ip)</li>
+          <li>DPI injector هم فعال می‌شود (مثل dpi_desync)</li>
+          <li>برای سناریوی Worker + AI ban domain-specific، Mixed معمولاً بهترین تعادل را می‌دهد</li>
+        </ul>
+      </section>
+
+      <section id="advanced-cores">
+        <h2>8) ابزارهای پیشرفته (کلیدهای s / c / a)</h2>
+        <p>این ابزارها کیفیت مسیرها و دیتابیس‌های تصمیم‌گیری را در طول زمان بهبود می‌دهند.</p>
+      </section>
+
+      <section id="desync-scanner">
+        <h2>8.1 Desync Scanner (کلید s)</h2>
+        <h3>خروجی اصلی</h3>
+        <ul>
+          <li><code>desync_pairs.json</code> (مسیر write جدید: data/ با migration-aware IO)</li>
+        </ul>
+
+        <h3>پایپلاین</h3>
+        <ol class="pipeline">
+          <li>انتخاب لیست SNI (پیش‌فرض / clean_snis / سفارشی).</li>
+          <li>انتخاب منبع IP (DNS mining و/یا custom).</li>
+          <li>Resolution چنددوره‌ای DNS و ساخت candidate pairs.</li>
+          <li>verify_sni همزمان برای هر pair.</li>
+          <li>ذخیره pairهای معتبر و مرتب‌سازی نتایج.</li>
+        </ol>
+      </section>
+
+      <section id="sni-scanner">
+        <h2>8.2 SNI Scanner (کلید c)</h2>
+        <h3>هدف</h3>
+        <p>
+          پیدا کردن SNIهای clean روی IP تمیز Cloudflare و تولید <code>clean_snis.txt</code>.
+        </p>
+
+        <h3>منابع IP</h3>
+        <ul>
+          <li>IP دستی</li>
+          <li>Auto-mine از CNAME</li>
+          <li>Deep scan روی ASNهای Cloudflare ایران</li>
+          <li>Deep scan جهانی Cloudflare</li>
+        </ul>
+
+        <h3>ویژگی مهم</h3>
+        <p>
+          تشخیص DPI redirection با امضاهای محتوایی (مثل peyvandha/cra/10.10.3) انجام می‌شود تا false-clean کاهش یابد.
+        </p>
+      </section>
+
+      <section id="autotuner">
+        <h2>8.3 Auto-Tuner (کلید a)</h2>
+        <p>
+          Auto-Tuner نرخ‌های Asyncio/Masscan/Nmap را با روش تطبیقی تنظیم می‌کند و در config ذخیره می‌نماید.
+        </p>
+
+        <h3>منطق کلی</h3>
+        <ol class="pipeline">
+          <li>ایجاد baseline کم‌سرعت برای مرجع صحت</li>
+          <li>کالیبره دقت فعلی موتور</li>
+          <li>Ramp-up نرخ تا رسیدن به آستانه افت</li>
+          <li>Binary-like search برای نقطه بهینه</li>
+          <li>Verify مجدد و اعمال ضریب اطمینان</li>
+          <li>ذخیره نرخ‌های tuned در config</li>
+        </ol>
+      </section>
+
+      <section id="hidden">
+        <h2>9) قابلیت‌های پنهان و Passive (خیلی مهم)</h2>
+
+        <h3>1) Passive Background Scanner</h3>
+        <ul>
+          <li>در white/mixed فعال می‌شود.</li>
+          <li>از ISPهای مرتبط با cache فعلی الهام می‌گیرد و subnetهای جدید را می‌گردد.</li>
+          <li>IPهای جدید را به pool و cache اضافه می‌کند.</li>
+          <li>اگر IP فقط برای Worker مناسب باشد، برای دامنه‌های مشکل‌دار auto-ban می‌کند.</li>
+        </ul>
+
+        <h3>2) Health Checker</h3>
+        <ul>
+          <li>IPهای pool را دوره‌ای verify می‌کند.</li>
+          <li>IP مرده را به dead pool می‌برد و قابل احیا می‌کند.</li>
+          <li>route cache خراب را prune می‌کند و فایل route را rewrite می‌نماید.</li>
+        </ul>
+
+        <h3>3) Prewarm Routes</h3>
+        <p>در startup برای دامنه‌های latency-sensitive race اولیه می‌زند تا کاربر اولیه delay کمتری ببیند.</p>
+
+        <h3>4) Auto Pause پس‌زمینه هنگام لود</h3>
+        <p>
+          وقتی تعداد اتصال‌های active از آستانه (پیش‌فرض 6) بیشتر شود، passive/health موقتاً کند یا pause می‌شوند.
+        </p>
+
+        <h3>5) Purge استارت‌آپ برای media shards</h3>
+        <p>
+          routeهای قدیمی youtube/googlevideo و موارد مشابه در startup پاک می‌شوند تا stale-route تجربه کاربر را خراب نکند.
+        </p>
+
+        <h3>6) Auto DPI Strategy Rotation</h3>
+        <p>
+          اگر ارتباط‌های DPI خیلی سریع fail شوند، استراتژی خودکار عوض می‌شود (با fallback به classic در failureهای زیاد).
+        </p>
+
+        <h3>7) Log Throttling</h3>
+        <p>لاگ DPI پس از 10 ثانیه اول startup مخفی‌تر می‌شود تا bottleneck لاگ روی CPU رخ ندهد.</p>
+      </section>
+
+      <section id="files">
+        <h2>10) فایل‌ها و داده‌های خروجی</h2>
+
+        <table>
+          <thead><tr><th>فایل</th><th>کاربرد</th></tr></thead>
+          <tbody>
+            <tr><td>white_routes.txt</td><td>route cache (exact/wildcard)</td></tr>
+            <tr><td>banned_routes.txt</td><td>ban دامنه-محور برای IPها</td></tr>
+            <tr><td>failed_routes.txt</td><td>دامنه‌هایی که race شکست خورده</td></tr>
+            <tr><td>white_ips_cache.txt</td><td>کش دائمی IPهای خوب</td></tr>
+            <tr><td>scan_YYYYMMDD_HHMMSS.json</td><td>نتیجه اسکن‌های عادی</td></tr>
+            <tr><td>scan_cyclic_continuous.json</td><td>تجمیع اسکن cyclic</td></tr>
+            <tr><td>cyclic_archives/round_*.json</td><td>آرشیو هر دور cyclic</td></tr>
+            <tr><td>cloudflare_workers_ips.txt</td><td>Worker IPهای شناسایی‌شده</td></tr>
+            <tr><td>desync_pairs.json</td><td>Pairهای معتبر SNI/IP</td></tr>
+            <tr><td>clean_snis.txt</td><td>SNIهای clean یافته‌شده</td></tr>
+            <tr><td>scanner_config.json</td><td>تنظیمات پایدار برنامه</td></tr>
+          </tbody>
+        </table>
+
+        <div class="note small">
+          برخی فایل‌ها با Data Store به مسیر <code>data/</code> migrate می‌شوند (خواندن legacy + نوشتن مدرن).
+        </div>
+      </section>
+
+      <section id="architecture">
+        <h2>11) معماری فنی (خلاصه Whitepaper)</h2>
+
+        <h3>لایه‌بندی</h3>
+        <ol>
+          <li><strong>Entry/Orchestration</strong>: <code>main.py</code>, <code>cores/ui.py</code></li>
+          <li><strong>Service Layer</strong>: <code>app_service</code>, <code>route_service</code>, <code>scan_service</code></li>
+          <li><strong>Core Engines</strong>: <code>white_core</code>, <code>route_manager</code>, <code>scanner</code>, <code>desync_core</code></li>
+          <li><strong>State/IO</strong>: <code>runtime_state</code>, <code>config</code>, <code>paths</code>, <code>storage</code>, <code>data_store</code></li>
+        </ol>
+
+        <h3>الگوی تصمیم‌گیری Route</h3>
+        <pre>Direct Rules (.ir / localhost / IP literal)
+  -> Cache Hit (exact/wildcard)
+    -> Domain-specific Ban Check
+      -> Concurrent Race (target + pool)
+        -> Persist Winner / Fail Log</pre>
+
+        <h3>Response Classification</h3>
+        <ul>
+          <li><strong>reject</strong>: امضاهای block/captive/region</li>
+          <li><strong>soft_accept</strong>: موردهای Worker-like (قابل استفاده محدود)</li>
+          <li><strong>accept</strong>: وضعیت HTTP معتبر + footprint محتوایی/سرور</li>
+          <li><strong>dead</strong>: timeout/عدم پاسخ یا ساختار نامعتبر</li>
+        </ul>
+      </section>
+
+      <section id="troubleshoot">
+        <h2>12) عیب‌یابی دقیق</h2>
+
+        <h3>پروکسی بالا می‌آید ولی اتصال برقرار نیست</h3>
+        <ul>
+          <li>بررسی کن برنامه روی پورت درست گوش می‌دهد (پیش‌فرض 7080).</li>
+          <li>کلاینت واقعاً روی <code>127.0.0.1:7080</code> ست شده باشد.</li>
+          <li>در مود d/m اگر injector بالا نیامد، sudo/root یا پیش‌نیاز سیستم را بررسی کن.</li>
+        </ul>
+
+        <h3>دامنه خاص fail می‌شود ولی بقیه خوب‌اند</h3>
+        <ul>
+          <li>از گزینه <strong>[6]</strong> استفاده کن تا route آن دامنه reset شود.</li>
+          <li>ban domain-specific باعث می‌شود IP برای بقیه دامنه‌ها قابل استفاده بماند.</li>
+        </ul>
+
+        <h3>اسکن خیلی کند است</h3>
+        <ul>
+          <li>Auto-Tuner اجرا کن (کلید <strong>a</strong>).</li>
+          <li>در اسکن، preflight روی masscan/nmap را فعال کن.</li>
+          <li>کیفیت شبکه را در Auto-Tuner درست انتخاب کن (Good/Normal/Shitty).</li>
+        </ul>
+
+        <h3>لاگ خیلی زیاد است</h3>
+        <ul>
+          <li>گزینه Always Show DPI Logs را خاموش نگه دار.</li>
+          <li>برنامه به‌صورت پیش‌فرض پس از 10 ثانیه لاگ DPI را کم می‌کند.</li>
+        </ul>
+      </section>
+
+      <section id="safety">
+        <h2>13) نکات امنیتی/عملیاتی</h2>
+        <ul>
+          <li>به‌طور پیش‌فرض هیچ dependency پایتون بیرونی لازم نیست (استانداردلایبرری).</li>
+          <li>برای مسیرهای raw packet سطح دسترسی سیستم‌عامل اهمیت دارد.</li>
+          <li>فایل‌های route/cache را دوره‌ای بررسی کن تا stale state نداشته باشی.</li>
+          <li>پس از تغییرات بزرگ، smoke harness را اجرا کن:</li>
+        </ul>
+        <pre>python main.py --core smoke</pre>
+
+        <div class="ok">
+          این راهنما به‌صورت کامل آفلاین قابل مشاهده است؛ برای استفاده کافی‌ست همین فایل HTML را در مرورگر باز کنید.
+        </div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
