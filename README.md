@@ -1,8 +1,8 @@
 # IROpenRelayFinder
 
-IROpenRelayFinder is a rebranded academic and educational toolkit for controlled relay testing and path verification.
+IROpenRelayFinder is an academic and educational toolkit for controlled relay testing and path verification.
 
-It is intended for laboratory-style use only and is limited to the Iranian IP space.
+It is limited to the Iranian IP space.
 
 ## Scope
 
@@ -10,11 +10,6 @@ It is intended for laboratory-style use only and is limited to the Iranian IP sp
 - Tests only Iranian IP space
 - Linux-first and stdlib-only
 - No external Python dependencies required
-
-## What changed
-
-The project has been reorganized and rebranded.
-In this README, the tool is referred to as tester.
 
 ## Overview
 
@@ -66,14 +61,6 @@ or:
 python scripts/smoke_harness.py
 ```
 
-### Other cores
-
-```bash
-python main.py --core desync_tester
-python main.py --core sni_tester
-python main.py --core autotuner
-```
-
 ## Typical workflow
 
 1. Run the tester
@@ -84,32 +71,7 @@ python main.py --core autotuner
 ## Supported modes
 
 - white_ip: route through verified relay paths
-- dpi_desync: configuration for controlled path variation
 - mixed: combines both behaviors
-
-## Project layout
-
-```text
-IROpenRelayFinder/
-├── main.py
-├── README.md
-├── ui_new.py
-├── cores/
-│   ├── ui.py
-│   ├── ui_layout.py
-│   ├── ui_asn.py
-│   ├── ui_scan.py
-│   ├── ui_tools.py
-│   ├── white_core.py
-│   ├── scanner.py
-│   ├── desync_core.py
-│   ├── autotuner.py
-│   └── smoke.py
-├── utils/
-├── assets/
-├── IranASNs/
-└── cyclic_archives/
-```
 
 ## Data files
 
@@ -118,7 +80,6 @@ IROpenRelayFinder/
 - failed_routes.txt: failure history
 - white_ips_cache.txt: reusable verified pool
 - scanner_config.json: runtime configuration
-- desync_pairs.json: saved associations
 - scan_YYYYMMDD_HHMMSS.json: tester snapshots
 - cyclic_archives/round_*.json: archived test rounds
 
