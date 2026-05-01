@@ -8,13 +8,17 @@ import utils.helpers as helpers
 
 import cores.ui_asn as ui_asn
 import cores.ui_layout as ui_layout
+import cores.ui_prompts as ui_prompts
 
 
 def menu_reroute_domain():
     ui_layout.draw_header(ui_mode="white")
     ui_layout.print_section("FORCE REROUTE", tone="mode_white")
     ui_layout.print_hint("Isolates a bad IP for one domain while keeping it usable for others.")
-    domain = input("\nEnter domain (e.g. chatgpt.com): ").strip().lower()
+    domain = ui_prompts.prompt_text(
+        "\nEnter domain (e.g. chatgpt.com)",
+        remember_key="force_reroute.domain",
+    ).strip().lower()
     if not domain:
         return
 
@@ -32,7 +36,7 @@ def menu_reroute_domain():
         if result.get("removed_failed"):
             ui_layout.print_ok("Removed from failed domains list so it can be raced again.")
 
-    input("\nPress Enter to return...")
+    ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
 
 
 def menu_inspect_ips():
@@ -49,12 +53,12 @@ def menu_inspect_ips():
     if choice == "1":
         ips_to_check = list(config.IP_POOL.keys())
         if not ips_to_check:
-            input(ui_layout.color_text("[-] Dynamic Pool is empty. Press Enter to return...", "err"))
+            ui_prompts.pause(ui_layout.color_text("[-] Dynamic Pool is empty. Press Enter to return...", "err"), action_label="Return to Main Menu")
             return
     elif choice == "2":
         ips_to_check = list(helpers.load_white_cache())
         if not ips_to_check:
-            input(ui_layout.color_text("[-] White Cache is empty. Press Enter to return...", "err"))
+            ui_prompts.pause(ui_layout.color_text("[-] White Cache is empty. Press Enter to return...", "err"), action_label="Return to Main Menu")
             return
     elif choice == "3":
         print("Paste IPs/CIDRs/ASNs or enter file path (Press Enter on empty line to finish):")
@@ -95,7 +99,7 @@ def menu_inspect_ips():
 
     print("-" * 108)
     print(f"[*] Total endpoints inspected: {len(ips_to_check)}")
-    input("\nPress Enter to return...")
+    ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
 
 
 def menu_manage_route_rules():
@@ -145,7 +149,7 @@ def menu_manage_route_rules():
                 ui_layout.print_err(f"Invalid pattern: {result['pattern']}")
             else:
                 ui_layout.print_err("Pattern is empty.")
-            input("\nPress Enter to continue...")
+            ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")
 
         elif choice == "2":
             pattern = input("Enter domain/glob/regex (e.g. gemini.google.com, *.google.com, re:^gemini\\.): ").strip().lower()
@@ -160,7 +164,7 @@ def menu_manage_route_rules():
                 ui_layout.print_err(f"Invalid pattern: {result['pattern']}")
             else:
                 ui_layout.print_err("Pattern is empty.")
-            input("\nPress Enter to continue...")
+            ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")
 
         elif choice == "3":
             pattern = input("Pattern to remove from DO_NOT_ROUTE: ").strip().lower()
@@ -171,7 +175,7 @@ def menu_manage_route_rules():
                 ui_layout.print_warn(f"Pattern not found: {result['pattern']}")
             else:
                 ui_layout.print_err("Pattern is empty.")
-            input("\nPress Enter to continue...")
+            ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")
 
         elif choice == "4":
             pattern = input("Pattern to remove from ALWAYS_ROUTE: ").strip().lower()
@@ -182,4 +186,4 @@ def menu_manage_route_rules():
                 ui_layout.print_warn(f"Pattern not found: {result['pattern']}")
             else:
                 ui_layout.print_err("Pattern is empty.")
-            input("\nPress Enter to continue...")
+            ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")

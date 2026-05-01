@@ -9,6 +9,7 @@ import random
 # Updated imports to prevent namespace collision with global 'utils' libraries
 import utils.config as config
 import utils.helpers as helpers
+import cores.ui_prompts as ui_prompts
 import utils.workers as workers
 from utils.app_service import APP_SERVICE
 from utils.runtime_state import STATE
@@ -637,7 +638,7 @@ async def run():
         import traceback
         traceback.print_exc()
         print(f"\n[-] FATAL CRASH in proxy engine: {e}")
-        input("Press Enter to return to main menu...")
+        ui_prompts.pause("Press Enter to return to main menu...", action_label="Return to Main Menu")
 
 async def _run_proxy():
     config.load_config()

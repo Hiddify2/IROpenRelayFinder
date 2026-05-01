@@ -291,7 +291,7 @@ async def run():
         fp = input("File path: ").strip()
         if not os.path.exists(fp):
             print_err("File not found.")
-            input("Press Enter to return...")
+            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
             return
         with open(fp, "r") as f:
             raw_lines = [l.strip() for l in f if l.strip()]
@@ -303,7 +303,7 @@ async def run():
         cached = helpers.load_socks5_cache()
         if not cached:
             print_err("SOCKS5 cache is empty.")
-            input("Press Enter to return...")
+            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
             return
         raw_lines = list(dict.fromkeys(ip for ip, _ in cached))
         print_hint(f"Loaded {len(raw_lines)} IPs from SOCKS5 cache.")
@@ -312,7 +312,7 @@ async def run():
         import cores.ui_asn as ui_asn
         subnets = ui_asn.menu_search_asn()
         if not subnets:
-            input("Press Enter to return...")
+            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
             return
         raw_lines = list(subnets)
 
@@ -323,7 +323,7 @@ async def run():
     ips = _expand_targets(raw_lines)
     if not ips:
         print_err("No valid IPs resolved.")
-        input("Press Enter to return...")
+        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
         return
 
     ips, dropped = asn_engine.filter_to_iranian(ips)
@@ -331,12 +331,12 @@ async def run():
         print_warn(f"{dropped} non-Iranian IP(s) were dropped (not found in IranASN database).")
     if not ips:
         print_err("No Iranian IPs remain after filtering.")
-        input("Press Enter to return...")
+        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
         return
     print_ok(f"{len(ips)} Iranian IP(s) queued.")
 
     # ── 2. Ports ─────────────────────────────────────────────────────────────
-    print()
+    draw_header()
     default_str = ", ".join(str(p) for p in DEFAULT_SOCKS5_PORTS)
     extended_str = ", ".join(str(p) for p in EXTENDED_SOCKS5_PORTS)
     port_key = ui_prompts.menu_choice(
@@ -363,7 +363,7 @@ async def run():
         socks5_ports = list(DEFAULT_SOCKS5_PORTS)
 
     # ── 3. Scan Method ────────────────────────────────────────────────────────
-    print()
+    draw_header()
     has_masscan = shutil.which("masscan") is not None
     has_nmap    = shutil.which("nmap")    is not None
 
@@ -380,14 +380,11 @@ async def run():
         method_map[str(opt)] = "nmap"
         method_options.append((str(opt), "Nmap preflight", "Reliable port scan, asyncio recovery sweep, then SOCKS5 verify"))
 
-    saved_method = str(ui_prompts.get_pref("socks5_scan.method", "asyncio")).strip().lower()
-    method_default = next((k for k, v in method_map.items() if v == saved_method), "1")
     method_key = ui_prompts.menu_choice(
         "SCAN METHOD",
         method_options,
-        default=method_default,
+        default="1",
         prompt="Method",
-        remember_key="socks5_scan.method_key",
     )
     method = method_map.get(method_key, "asyncio")
     ui_prompts.set_pref("socks5_scan.method", method)
@@ -420,7 +417,7 @@ async def run():
         candidates = await _gather_candidates(method, ips, socks5_ports)
         if not candidates:
             print_warn("No candidate endpoints to verify.")
-            input("\nPress Enter to return...")
+            ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
             return
 
         print()
@@ -430,7 +427,8 @@ async def run():
         working = await _probe_socks5(candidates, concurrency, timeout, existing_cache=existing_cache)
 
     except KeyboardInterrupt:
-        print("\n\n[-] Scan interrupted.")
+        ui_prompts.clear_status_line()
+        print("\n[-] Scan interrupted.")
 
     # ── 6. Results ────────────────────────────────────────────────────────────
     print()
@@ -447,7 +445,8 @@ async def run():
     else:
         print_warn("No working SOCKS5 proxies found in the scanned range.")
 
-    input("\nPress Enter to return to main menu...")
+    ui_prompts.clear_status_line()
+    ui_prompts.pause("\nPress Enter to return to main menu...", action_label="Return to Main Menu")
 
 
 if __name__ == "__main__":

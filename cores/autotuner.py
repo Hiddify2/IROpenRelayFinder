@@ -808,7 +808,7 @@ async def run():
 
     if not any([tune_asyncio, tune_masscan, tune_nmap]):
         print("[-] No scanners selected for tuning.")
-        input("Press Enter to return...")
+        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
         return
 
     # ── Sudo setup ─────────────────────────────────────────────────────────────
@@ -904,7 +904,7 @@ async def run():
     ips = expand_target(target, silent=True)
     if not ips:
         print("[-] Invalid target or no IPs found.")
-        input("Press Enter to return...")
+        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
         return
 
     ips = list(dict.fromkeys(ips))
@@ -930,7 +930,7 @@ async def run():
             f"[-] Baseline too low ({len(baseline_eps)} endpoints). "
             "Try a subnet with more active hosts."
         )
-        input("Press Enter to return...")
+        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
         return
 
     print(f"[+] TCP Baseline: {len(baseline_eps)} live endpoints.")
@@ -1026,7 +1026,7 @@ async def run():
 
     print("\n[+] Auto-Tuning complete. Safe, endurance-verified rates applied.")
     APP_SERVICE.save_runtime_config()
-    input("Press Enter to return to main menu...")
+    ui_prompts.pause("Press Enter to return to main menu...", action_label="Return to Main Menu")
 
 
 if __name__ == "__main__":

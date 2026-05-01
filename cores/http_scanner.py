@@ -404,7 +404,7 @@ async def run():
         fp = input("File path: ").strip()
         if not os.path.exists(fp):
             print_err("File not found.")
-            input("Press Enter to return...")
+            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
             return
         with open(fp, "r") as f:
             raw_lines = [l.strip() for l in f if l.strip()]
@@ -416,7 +416,7 @@ async def run():
         cached = load_http_cache()
         if not cached:
             print_err("HTTP proxy cache is empty.")
-            input("Press Enter to return...")
+            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
             return
         raw_lines = list(dict.fromkeys(ip for ip, _ in cached))
         print_hint(f"Loaded {len(raw_lines)} IPs from HTTP cache.")
@@ -425,7 +425,7 @@ async def run():
         import cores.ui_asn as ui_asn
         subnets = ui_asn.menu_search_asn()
         if not subnets:
-            input("Press Enter to return...")
+            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
             return
         raw_lines = list(subnets)
 
@@ -436,7 +436,7 @@ async def run():
     ips = _expand_targets(raw_lines)
     if not ips:
         print_err("No valid IPs resolved.")
-        input("Press Enter to return...")
+        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
         return
 
     ips, dropped = asn_engine.filter_to_iranian(ips)
@@ -444,12 +444,12 @@ async def run():
         print_warn(f"{dropped} non-Iranian IP(s) were dropped (not found in IranASN database).")
     if not ips:
         print_err("No Iranian IPs remain after filtering.")
-        input("Press Enter to return...")
+        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
         return
     print_ok(f"{len(ips)} Iranian IP(s) queued.")
 
     # ── Ports ───────────────────────────────────────────────────────────────
-    print()
+    draw_header()
     default_str = ", ".join(str(p) for p in DEFAULT_HTTP_PORTS)
     extended_str = ", ".join(str(p) for p in EXTENDED_HTTP_PORTS)
     port_key = ui_prompts.menu_choice(
@@ -476,7 +476,7 @@ async def run():
         http_ports = list(DEFAULT_HTTP_PORTS)
 
     # ── Method ──────────────────────────────────────────────────────────────
-    print()
+    draw_header()
     has_masscan = shutil.which("masscan") is not None
     has_nmap = shutil.which("nmap") is not None
 
@@ -493,14 +493,11 @@ async def run():
         method_map[str(opt)] = "nmap"
         method_options.append((str(opt), "Nmap preflight", "Reliable port scan, then 3-wave verify"))
 
-    saved_method = str(ui_prompts.get_pref("http_scan.method", "asyncio")).strip().lower()
-    method_default = next((k for k, v in method_map.items() if v == saved_method), "1")
     method_key = ui_prompts.menu_choice(
         "SCAN METHOD",
         method_options,
-        default=method_default,
+        default="1",
         prompt="Method",
-        remember_key="http_scan.method_key",
     )
     method = method_map.get(method_key, "asyncio")
     ui_prompts.set_pref("http_scan.method", method)
@@ -558,7 +555,7 @@ async def run():
         candidates = await _gather_candidates(method, ips, http_ports)
         if not candidates:
             print_warn("No candidate endpoints to verify.")
-            input("\nPress Enter to return...")
+            ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
             return
 
         random.shuffle(candidates)
@@ -569,7 +566,8 @@ async def run():
         working = await _run_pipeline(candidates, cache_set, w1_cap, w2_cap, w3_cap)
 
     except KeyboardInterrupt:
-        print("\n\n[-] Scan interrupted.")
+        ui_prompts.clear_status_line()
+        print("\n[-] Scan interrupted.")
 
     # ── Results ─────────────────────────────────────────────────────────────
     print()
@@ -587,7 +585,8 @@ async def run():
     else:
         print_warn("No working HTTP proxies found in the scanned range.")
 
-    input("\nPress Enter to return to main menu...")
+    ui_prompts.clear_status_line()
+    ui_prompts.pause("\nPress Enter to return to main menu...", action_label="Return to Main Menu")
 
 
 if __name__ == "__main__":

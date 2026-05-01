@@ -15,6 +15,7 @@ from utils.route_service import ROUTE_SERVICE
 import cores.ui_layout as ui_layout
 import cores.ui_scan as ui_scan
 import cores.ui_tools as ui_tools
+import cores.ui_prompts as ui_prompts
 
 
 _COLOR = {}
@@ -122,8 +123,10 @@ class _CursesConsole:
         self._orig_clear_screen = None
         self._orig_no_color = None
         self._screen_lines = {}
+        self._screen_line_indices = {}
         self._input_queue = []
         self._scroll_offset = 0
+        self._input_box_confirm = None
 
     def _sanitize(self, text):
         if text is None:
@@ -183,14 +186,17 @@ class _CursesConsole:
         start = max(0, end - content_rows)
         visible = self.lines[start:end]
         self._screen_lines = {}
+        self._screen_line_indices = {}
 
         for row, line in enumerate(visible):
+            line_index = start + row
             if row < h - 2:
                 attr = _attr("selected", curses.A_REVERSE) if row == selected_row else self._line_attr(line)
                 _safe_addnstr(self.stdscr, row, 0, line, max(1, w - 1), attr)
                 self._screen_lines[row] = line
+                self._screen_line_indices[row] = line_index
 
-        _safe_hline(self.stdscr, h - 2, 0, ord('-'), max(1, w - 1), _attr("dim"))
+        _safe_addnstr(self.stdscr, h - 2, 0, "-" * max(1, w - 1), max(1, w - 1), _attr("dim"))
         if self._scroll_offset:
             marker = f" scroll {self._scroll_offset} lines above | PgDn/End to bottom "
             _safe_addnstr(self.stdscr, h - 2, max(0, w - len(marker) - 1), marker, len(marker), _attr("warn"))
@@ -208,8 +214,6 @@ class _CursesConsole:
             value = _choice_from_line_click(line, len(line))
             if value is None:
                 continue
-            # For command rows with multiple tokens, keep token-specific mouse
-            # behavior but avoid making them noisy in keyboard navigation.
             if "commands:" in line.lower() and len(re.findall(r"\[[^\]]+\]", line)) > 1:
                 continue
             key = (row, value)
@@ -217,7 +221,15 @@ class _CursesConsole:
                 continue
             seen.add(key)
             choices.append((row, value))
-        return choices
+
+        if not choices:
+            return choices
+
+        # Constrain navigation to the most recent visible choice cluster.
+        recent_rows = {row for row, _value in choices}
+        recent_start = max(0, max(recent_rows) - 24)
+        filtered = [(row, value) for row, value in choices if row >= recent_start]
+        return filtered or choices
 
     def _infer_default_choice_index(self, prompt, choices):
         if not choices:
@@ -476,6 +488,7 @@ class _CursesConsole:
             "search query" in p
             or "enter domain" in p
             or "domain" in p and "e.g." in p
+            or "timeout" in p
         )
 
     def _capture_text_input_box(self, prompt):
@@ -484,7 +497,9 @@ class _CursesConsole:
         except curses.error:
             pass
         try:
-            buf = []
+            prefill, clear_on_type = self._parse_input_box_default(prompt)
+            buf = list(prefill)
+            cleared_prefill = False
             while True:
                 self._draw_text_input_box(prompt, "".join(buf))
                 key = self.stdscr.getch()
@@ -493,20 +508,47 @@ class _CursesConsole:
                 if key in (curses.KEY_BACKSPACE, 127, 8):
                     if buf:
                         buf.pop()
+                        cleared_prefill = True
                     continue
                 if key in (27, curses.KEY_RESIZE):
                     continue
                 if key == curses.KEY_MOUSE:
+                    if self._handle_input_box_click():
+                        return "".join(buf)
                     continue
                 if 0 <= key <= 255:
                     ch = chr(key)
                     if ch.isprintable():
+                        if clear_on_type and prefill and not cleared_prefill:
+                            buf = [ch]
+                            cleared_prefill = True
+                            continue
                         buf.append(ch)
         finally:
             try:
                 curses.curs_set(0)
             except curses.error:
                 pass
+
+    def _parse_input_box_default(self, prompt):
+        if not prompt:
+            return "", False
+        match = re.search(r"\[\s*default\s+([^\]]+)\]", prompt, flags=re.IGNORECASE)
+        default_value = match.group(1).strip() if match else ""
+        clear_on_type = "enter domain" in prompt.lower() and bool(default_value)
+        return default_value, clear_on_type
+
+    def _handle_input_box_click(self):
+        if not self._input_box_confirm:
+            return False
+        try:
+            _, mx, my, _, bstate = curses.getmouse()
+        except Exception:
+            return False
+        if not (bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED)):
+            return False
+        row, start_x, end_x = self._input_box_confirm
+        return my == row and start_x <= mx <= end_x
 
     def _draw_text_input_box(self, prompt, current):
         h, w = self.stdscr.getmaxyx()
@@ -526,7 +568,16 @@ class _CursesConsole:
             self.stdscr.move(top + 4, min(right - 1, left + 2 + len(current)))
         except curses.error:
             pass
-        _safe_addnstr(self.stdscr, top + box_h - 1, left + 2, "Enter: submit  Esc: ignore", box_w - 4, _attr("dim"))
+        footer = "Enter: submit  Esc: ignore"
+        _safe_addnstr(self.stdscr, top + box_h - 1, left + 2, footer, box_w - 4, _attr("dim"))
+        button = "[Confirm]"
+        btn_start = right - len(button) - 2
+        btn_end = btn_start + len(button)
+        if btn_start > left + 2:
+            _safe_addnstr(self.stdscr, top + box_h - 1, btn_start, button, len(button), _attr("section", curses.A_BOLD))
+            self._input_box_confirm = (top + box_h - 1, btn_start, btn_end)
+        else:
+            self._input_box_confirm = None
         self.stdscr.refresh()
 
     def install(self):
@@ -771,7 +822,7 @@ def main():
         ui_layout.print_section(title, tone=tone)
         for line in lines:
             print(line)
-        input("\nPress Enter to continue...")
+        ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")
 
     def menu_change_proxy_port():
         ui_layout.draw_header(ui_mode="white")

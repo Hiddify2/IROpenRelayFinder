@@ -141,7 +141,7 @@ def menu_scan():
                     if line.strip():
                         raw_targets.append(line.strip())
         else:
-            input(ui_layout.color_text("[-] File not found. Press Enter to return...", "err"))
+            ui_prompts.pause(ui_layout.color_text("[-] File not found. Press Enter to return...", "err"), action_label="Return to Main Menu")
             return
     elif choice == "2":
         print("Paste your IPs/CIDRs/ASNs (Press Enter on an empty line to finish):")
@@ -153,14 +153,14 @@ def menu_scan():
     elif choice == "3":
         cached_ips = helpers.load_white_cache()
         if not cached_ips:
-            input(ui_layout.color_text("[-] White IPs Cache is empty. Press Enter to return...", "err"))
+            ui_prompts.pause(ui_layout.color_text("[-] White IPs Cache is empty. Press Enter to return...", "err"), action_label="Return to Main Menu")
             return
         ui_layout.print_hint(f"Queued {len(cached_ips)} active cached endpoints.")
         raw_targets = list(cached_ips)
     elif choice == "4":
         subnets = ui_asn.menu_search_asn()
         if not subnets:
-            input("Press Enter to return...")
+            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
             return
         raw_targets.extend(subnets)
     elif choice == "0":
@@ -180,14 +180,14 @@ def menu_scan():
             expanded_items.extend(asn_engine.expand_target(t))
 
     if not expanded_items:
-        input(ui_layout.color_text("[-] No valid IPs to scan. Press Enter to return...", "err"))
+        ui_prompts.pause(ui_layout.color_text("[-] No valid IPs to scan. Press Enter to return...", "err"), action_label="Return to Main Menu")
         return
 
     expanded_items, dropped = asn_engine.filter_to_iranian(expanded_items)
     if dropped:
         ui_layout.print_warn(f"{dropped} non-Iranian IP(s) were dropped (not found in IranASN database).")
     if not expanded_items:
-        input(ui_layout.color_text("[-] No Iranian IPs remain after filtering. Press Enter to return...", "err"))
+        ui_prompts.pause(ui_layout.color_text("[-] No Iranian IPs remain after filtering. Press Enter to return...", "err"), action_label="Return to Main Menu")
         return
 
     selected_ports = prompt_target_ports()
@@ -209,7 +209,7 @@ def menu_scan():
     config.set_target_ports(merged_ports)
 
     if not endpoints:
-        input(ui_layout.color_text("[-] No endpoints derived from provided IPs. Press Enter to return...", "err"))
+        ui_prompts.pause(ui_layout.color_text("[-] No endpoints derived from provided IPs. Press Enter to return...", "err"), action_label="Return to Main Menu")
         return
 
     base_ips = list(dict.fromkeys(preflight_ips))
@@ -359,7 +359,7 @@ def menu_scan():
                 round_num += 1
                 continue
             else:
-                input(ui_layout.color_text("[-] No IPs survived pre-flight or scan cancelled. Press Enter to return...", "err"))
+                ui_prompts.pause(ui_layout.color_text("[-] No IPs survived pre-flight or scan cancelled. Press Enter to return...", "err"), action_label="Return to Main Menu")
                 return
 
         print(f"[*] Target IPs loaded for TLS Verification: {len(current_targets)}")
@@ -370,7 +370,8 @@ def menu_scan():
         try:
             asyncio.run(SCAN_SERVICE.run_mass_scan(current_targets, config.DEFAULT_DOMAINS, successful_results, skip_tcp=skip_tcp, deep_scan=is_debug_mode))
         except KeyboardInterrupt:
-            print("\n\n[!] Scan INTERRUPTED by user. Finalizing saved IPs...")
+            ui_prompts.clear_status_line()
+            print("\n[!] Scan interrupted by user. Finalizing saved IPs...")
             interrupted = True
 
         for r in successful_results:
@@ -428,10 +429,12 @@ def menu_scan():
             time.sleep(5)
             round_num += 1
         except KeyboardInterrupt:
-            print("\n\n[!] Scan INTERRUPTED by user. Exiting cyclic loop...")
+            ui_prompts.clear_status_line()
+            print("\n[!] Scan interrupted by user. Exiting cyclic loop...")
             break
 
-    input("\nPress Enter to return to main menu...")
+        ui_prompts.clear_status_line()
+        ui_prompts.pause("\nPress Enter to return to main menu...", action_label="Return to Main Menu")
 
 
 def menu_instant_connect():
@@ -456,7 +459,7 @@ def menu_instant_connect():
                     if line.strip():
                         raw_items.extend(asn_engine.expand_target(line.strip()))
         else:
-            input(ui_layout.color_text("[-] File not found. Press Enter to return...", "err"))
+            ui_prompts.pause(ui_layout.color_text("[-] File not found. Press Enter to return...", "err"), action_label="Return to Main Menu")
             return
     elif choice == "2":
         print("Paste your IPs/CIDRs/ASNs (Press Enter on an empty line to finish):")
@@ -472,14 +475,14 @@ def menu_instant_connect():
 
     raw_items = list(dict.fromkeys(raw_items))
     if not raw_items:
-        input(ui_layout.color_text("[-] No valid IPs parsed. Press Enter to return...", "err"))
+        ui_prompts.pause(ui_layout.color_text("[-] No valid IPs parsed. Press Enter to return...", "err"), action_label="Return to Main Menu")
         return
 
     raw_items, dropped = asn_engine.filter_to_iranian(raw_items)
     if dropped:
         ui_layout.print_warn(f"{dropped} non-Iranian IP(s) were dropped (not found in IranASN database).")
     if not raw_items:
-        input(ui_layout.color_text("[-] No Iranian IPs remain after filtering. Press Enter to return...", "err"))
+        ui_prompts.pause(ui_layout.color_text("[-] No Iranian IPs remain after filtering. Press Enter to return...", "err"), action_label="Return to Main Menu")
         return
 
     exact_endpoints, endpoints, _, _ = build_scan_endpoints(
@@ -488,7 +491,7 @@ def menu_instant_connect():
         strip_explicit_ports=False,
     )
     if not endpoints:
-        input(ui_layout.color_text("[-] No endpoints derived from provided IPs. Press Enter to return...", "err"))
+        ui_prompts.pause(ui_layout.color_text("[-] No endpoints derived from provided IPs. Press Enter to return...", "err"), action_label="Return to Main Menu")
         return
 
     random.shuffle(endpoints)
@@ -511,7 +514,7 @@ def menu_instant_connect():
         interrupted = True
 
     if not successful_results:
-        input(ui_layout.color_text("[-] No usable IP:Port pairs found. Press Enter to return...", "err"))
+        ui_prompts.pause(ui_layout.color_text("[-] No usable IP:Port pairs found. Press Enter to return...", "err"), action_label="Return to Main Menu")
         return
 
     best_by_endpoint = {}
@@ -553,7 +556,7 @@ def menu_instant_connect():
     newly_cached = helpers.save_to_white_cache(usable_eps)
     if newly_cached > 0:
         print(f"[+] Added {newly_cached} IPs to the permanent White IP cache.")
-    input("Press Enter to return to main menu...")
+    ui_prompts.pause("Press Enter to return to main menu...", action_label="Return to Main Menu")
 
 
 def menu_manage_pool():
@@ -582,4 +585,4 @@ def menu_manage_pool():
                 pass
     else:
         ui_layout.print_err("No scan files found. Run a scan first.")
-    input("\nPress Enter to return...")
+    ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")

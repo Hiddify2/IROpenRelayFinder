@@ -31,7 +31,20 @@ def set_pref(key, value):
     _save_prefs(prefs)
 
 
-def pause(message="Press Enter to continue..."):
+def clear_status_line(width=160):
+    print("\r" + (" " * width) + "\r", end="", flush=True)
+
+
+def pause(message="Press Enter to continue...", action_label=None, prompt="Action"):
+    if action_label:
+        print(message)
+        menu_choice(
+            "",
+            [("1", action_label, None)],
+            default="1",
+            prompt=prompt,
+        )
+        return
     input(message)
 
 
@@ -49,14 +62,32 @@ def read_multiline(prompt="Paste entries (empty line to finish):"):
 def prompt_yes_no(prompt, default=False, remember_key=None):
     if remember_key is not None:
         default = bool(get_pref(remember_key, default))
-    hint = "Y/n" if default else "y/N"
-    raw = input(f"{prompt} ({hint}): ").strip().lower()
+    default_key = "y" if default else "n"
+    choice = menu_choice(
+        prompt,
+        [("y", "Yes", None), ("n", "No", None)],
+        default=default_key,
+        prompt="Choice",
+    )
+    value = choice == "y"
+    if remember_key is not None:
+        set_pref(remember_key, bool(value))
+    return value
+
+
+def prompt_text(prompt, default="", remember_key=None):
+    if remember_key is not None:
+        saved = get_pref(remember_key, default)
+        if isinstance(saved, str) and saved.strip():
+            default = saved.strip()
+    hint = f" [Default {default}]" if default else ""
+    raw = input(f"{prompt}{hint}: ").strip()
     if not raw:
         value = default
     else:
-        value = raw in {"y", "yes"}
-    if remember_key is not None:
-        set_pref(remember_key, bool(value))
+        value = raw
+    if remember_key is not None and value:
+        set_pref(remember_key, value)
     return value
 
 
