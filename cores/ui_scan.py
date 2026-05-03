@@ -48,6 +48,24 @@ def prompt_target_ports():
     return selected_ports
 
 
+def _filter_to_iranian_ips(items):
+    """
+    Keeps only IPs that appear in the Iranian ASN database.
+    Returns (filtered_items, dropped_ips) where dropped_ips is a list of
+    non-Iranian IP strings that were removed.
+    """
+    filtered = []
+    dropped = []
+    for item in items:
+        ip = str(item[0]) if isinstance(item, tuple) else str(item)
+        asn, _, _ = asn_engine.get_asn_info(ip)
+        if asn is not None:
+            filtered.append(item)
+        else:
+            dropped.append(ip)
+    return filtered, dropped
+
+
 def _has_explicit_port(item):
     if isinstance(item, tuple):
         return len(item) >= 2
@@ -284,6 +302,14 @@ def menu_scan():
             expanded_items.append(t)
         else:
             expanded_items.extend(asn_engine.expand_target(t))
+
+    if choice != "5":
+        expanded_items, dropped_ips = _filter_to_iranian_ips(expanded_items)
+        if dropped_ips:
+            ui_layout.print_warn(f"[!] Dropped {len(dropped_ips)} IP(s) not found in the Iranian ASN database.")
+            if len(dropped_ips) <= 10:
+                for ip in dropped_ips:
+                    print(f"    - {ip}")
 
     if not expanded_items:
         input(ui_layout.color_text("[-] No valid IPs to scan. Press Enter to return...", "err"))
@@ -563,6 +589,13 @@ def menu_instant_connect():
         return
 
     raw_items = list(dict.fromkeys(raw_items))
+    raw_items, dropped_ips = _filter_to_iranian_ips(raw_items)
+    if dropped_ips:
+        ui_layout.print_warn(f"[!] Dropped {len(dropped_ips)} IP(s) not found in the Iranian ASN database.")
+        if len(dropped_ips) <= 10:
+            for ip in dropped_ips:
+                print(f"    - {ip}")
+
     if not raw_items:
         input(ui_layout.color_text("[-] No valid IPs parsed. Press Enter to return...", "err"))
         return
