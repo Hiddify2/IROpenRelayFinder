@@ -3,22 +3,19 @@ import time
 
 import utils.asn_engine as asn_engine
 from utils.app_service import APP_SERVICE
+from utils import mmdf_ca
 import utils.config as config
 import utils.helpers as helpers
 
 import cores.ui_asn as ui_asn
 import cores.ui_layout as ui_layout
-import cores.ui_prompts as ui_prompts
 
 
 def menu_reroute_domain():
     ui_layout.draw_header(ui_mode="white")
     ui_layout.print_section("FORCE REROUTE", tone="mode_white")
     ui_layout.print_hint("Isolates a bad IP for one domain while keeping it usable for others.")
-    domain = ui_prompts.prompt_text(
-        "\nEnter domain (e.g. chatgpt.com)",
-        remember_key="force_reroute.domain",
-    ).strip().lower()
+    domain = input("\nEnter domain (e.g. chatgpt.com): ").strip().lower()
     if not domain:
         return
 
@@ -36,7 +33,7 @@ def menu_reroute_domain():
         if result.get("removed_failed"):
             ui_layout.print_ok("Removed from failed domains list so it can be raced again.")
 
-    ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
+    input("\nPress Enter to return...")
 
 
 def menu_inspect_ips():
@@ -53,12 +50,12 @@ def menu_inspect_ips():
     if choice == "1":
         ips_to_check = list(config.IP_POOL.keys())
         if not ips_to_check:
-            ui_prompts.pause(ui_layout.color_text("[-] Dynamic Pool is empty. Press Enter to return...", "err"), action_label="Return to Main Menu")
+            input(ui_layout.color_text("[-] Dynamic Pool is empty. Press Enter to return...", "err"))
             return
     elif choice == "2":
         ips_to_check = list(helpers.load_white_cache())
         if not ips_to_check:
-            ui_prompts.pause(ui_layout.color_text("[-] White Cache is empty. Press Enter to return...", "err"), action_label="Return to Main Menu")
+            input(ui_layout.color_text("[-] White Cache is empty. Press Enter to return...", "err"))
             return
     elif choice == "3":
         print("Paste IPs/CIDRs/ASNs or enter file path (Press Enter on empty line to finish):")
@@ -99,7 +96,96 @@ def menu_inspect_ips():
 
     print("-" * 108)
     print(f"[*] Total endpoints inspected: {len(ips_to_check)}")
-    ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
+    input("\nPress Enter to return...")
+
+
+def menu_install_mmdf_ca():
+    """Generate (if needed) and install the MMDF root CA into the OS trust store.
+
+    Without this, the proxy cannot present a leaf cert that the user's browser
+    will trust, so MMDF stays disabled and Meet/YouTube fall back to the
+    normal (often blocked) routing path.
+    """
+    ui_layout.draw_header(ui_mode="white")
+    ui_layout.print_section("MMDF CA — Install Root Certificate", tone="mode_white")
+    ui_layout.print_hint("Required so MMDF can MITM TLS to Meet/YouTube using a locally-trusted leaf cert.")
+
+    summary = mmdf_ca.status_summary()
+    backend = summary.get("backend")
+    if backend is None:
+        ui_layout.print_err("No cert backend available.")
+        if summary.get("cryptography_error"):
+            ui_layout.print_hint(f"Cryptography import error: {summary['cryptography_error']}")
+        ui_layout.print_hint("Install one of:")
+        ui_layout.print_hint("  - Python cryptography:  pip install cryptography")
+        ui_layout.print_hint("  - OpenSSL CLI:          apt install openssl  /  brew install openssl  /  choco install openssl")
+        input("\nPress Enter to return...")
+        return
+    ui_layout.print_hint(f"Active cert backend: {backend}")
+
+    if summary["ca_files_present"]:
+        ui_layout.print_ok(f"CA files present:\n   {summary['cert_path']}\n   {summary['key_path']}")
+    else:
+        ui_layout.print_warn("CA files have not been generated yet — will be created now.")
+
+    state = summary["is_installed"]
+    if state is True:
+        ui_layout.print_ok("CA appears to be installed in the OS trust store.")
+    elif state is False:
+        ui_layout.print_warn("CA is NOT installed in the OS trust store.")
+    else:
+        ui_layout.print_hint("Could not verify trust-store state automatically.")
+
+    print()
+    print(" [1] Install / Refresh CA in OS trust store")
+    print(" [2] Show CA file paths (for manual install)")
+    print(" [3] Re-generate the CA (overwrites the existing one)")
+    print(" [0] Back")
+    choice = input("\nChoice: ").strip().lower()
+
+    if choice == "1":
+        ui_layout.print_hint("Installing — you may be prompted for admin / sudo password...")
+        result = mmdf_ca.install_ca()
+        if result.get("ok"):
+            ui_layout.print_ok(result.get("message") or "Installed.")
+            ui_layout.print_hint("Restart your browser so it picks up the new trusted root.")
+        else:
+            ui_layout.print_err(result.get("message") or "Install failed.")
+            if result.get("requires_elevation"):
+                ui_layout.print_hint("Re-run this app with admin/sudo and try again.")
+        input("\nPress Enter to return...")
+
+    elif choice == "2":
+        try:
+            mmdf_ca.ensure_ca_files()
+        except Exception as e:
+            ui_layout.print_err(f"Could not ensure CA files: {e}")
+            input("\nPress Enter to return...")
+            return
+        cert = mmdf_ca.ca_cert_path()
+        key = mmdf_ca.ca_key_path()
+        ui_layout.print_ok("CA paths:")
+        print(f"  cert: {cert}")
+        print(f"  key:  {key}")
+        ui_layout.print_hint("Linux:   sudo cp <cert> /usr/local/share/ca-certificates/iropenrelayfinder-mmdf-ca.crt && sudo update-ca-certificates")
+        ui_layout.print_hint("macOS:   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain <cert>")
+        ui_layout.print_hint("Windows: certutil -addstore -f Root <cert>   (run as Administrator)")
+        input("\nPress Enter to return...")
+
+    elif choice == "3":
+        confirm = input("Type YES to overwrite the existing CA: ").strip()
+        if confirm == "YES":
+            try:
+                for p in (mmdf_ca.ca_cert_path(), mmdf_ca.ca_key_path()):
+                    if os.path.exists(p):
+                        os.remove(p)
+                mmdf_ca.ensure_ca_files()
+                ui_layout.print_ok("CA regenerated. Re-install it into the OS trust store.")
+            except Exception as e:
+                ui_layout.print_err(f"Failed: {e}")
+        else:
+            ui_layout.print_hint("Cancelled.")
+        input("\nPress Enter to return...")
 
 
 def menu_manage_route_rules():
@@ -149,7 +235,7 @@ def menu_manage_route_rules():
                 ui_layout.print_err(f"Invalid pattern: {result['pattern']}")
             else:
                 ui_layout.print_err("Pattern is empty.")
-            ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")
+            input("\nPress Enter to continue...")
 
         elif choice == "2":
             pattern = input("Enter domain/glob/regex (e.g. gemini.google.com, *.google.com, re:^gemini\\.): ").strip().lower()
@@ -164,7 +250,7 @@ def menu_manage_route_rules():
                 ui_layout.print_err(f"Invalid pattern: {result['pattern']}")
             else:
                 ui_layout.print_err("Pattern is empty.")
-            ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")
+            input("\nPress Enter to continue...")
 
         elif choice == "3":
             pattern = input("Pattern to remove from DO_NOT_ROUTE: ").strip().lower()
@@ -175,7 +261,7 @@ def menu_manage_route_rules():
                 ui_layout.print_warn(f"Pattern not found: {result['pattern']}")
             else:
                 ui_layout.print_err("Pattern is empty.")
-            ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")
+            input("\nPress Enter to continue...")
 
         elif choice == "4":
             pattern = input("Pattern to remove from ALWAYS_ROUTE: ").strip().lower()
@@ -186,4 +272,4 @@ def menu_manage_route_rules():
                 ui_layout.print_warn(f"Pattern not found: {result['pattern']}")
             else:
                 ui_layout.print_err("Pattern is empty.")
-            ui_prompts.pause("\nPress Enter to continue...", action_label="Continue")
+            input("\nPress Enter to continue...")

@@ -51,6 +51,7 @@ def color_text(text, tone="default"):
         "default": "0",
         "title": "1;36",
         "mode_white": "1;36",
+        "mode_desync": "1;35",
         "section": "1;34",
         "launch": "1;32",
         "nav": "1;33",
@@ -83,24 +84,34 @@ def print_err(text):
 
 
 def _mode_label(connection_mode):
+    if connection_mode == "dpi_desync":
+        return "DPI Desync"
+    if connection_mode == "mixed":
+        return "Mixed"
     return "White Routing"
 
 
 def draw_header(ui_mode=None):
     helpers.clear_screen()
     line = color_text("═" * 60, "dim")
-    title = color_text(f" IROpenRelayFinder v{config.VERSION} ", "title")
+    title = color_text(f" IROPENRELAYFINDER v{config.VERSION} ", "title")
     print(line)
     print(title)
     print(line)
 
     pool_size = len(config.IP_POOL)
-    active_ui = "IROpenRelayFinder"
+    active_ui = "IROpenRelayFinder" if ui_mode != "desync" else "Desync"
     print(f" {color_text('UI Mode', 'section'):12}: {active_ui}")
     print(f" {color_text('Conn Mode', 'section'):12}: {_mode_label(config.CONNECTION_MODE)}")
     print(f" {color_text('Proxy', 'section'):12}: {config.PROXY_HOST}:{config.PROXY_PORT} (Local: {helpers.get_local_ip()})")
 
-    print(f" {color_text('IP Pool', 'section'):12}: {pool_size} loaded")
+    if config.CONNECTION_MODE in ["dpi_desync", "mixed"]:
+        print(f" {color_text('DPI SNI', 'section'):12}: {config.DPI_SNI}")
+        print(f" {color_text('DPI IP', 'section'):12}: {config.DPI_IP if config.DPI_IP else 'Auto'}")
+        print(f" {color_text('DPI Strat', 'section'):12}: {config.ACTIVE_DPI_STRATEGY.upper()} | Pool: {', '.join(config.DPI_STRATEGIES).upper()}")
+
+    if config.CONNECTION_MODE in ["white_ip", "mixed"]:
+        print(f" {color_text('IP Pool', 'section'):12}: {pool_size} loaded")
 
     if config.TUNED_MASSCAN_RATE or config.TUNED_NMAP_MIN_RATE or config.MAX_CONCURRENT_SCANS != 100:
         nmap_disp = f"{config.TUNED_NMAP_MIN_RATE}-{config.TUNED_NMAP_MAX_RATE}" if config.TUNED_NMAP_MIN_RATE else "N/A"
@@ -111,7 +122,26 @@ def draw_header(ui_mode=None):
 
 
 def print_main_menu(ui_mode="white"):
-    print(color_text(" IROpenRelayFinder MODE", "mode_white"))
+    if ui_mode == "desync":
+        print(color_text(" DESYNC MODE", "mode_desync"))
+        print(" [1] Configure DPI Desync Strategies")
+        print(" [2] Select DPI Target (SNI/IP)")
+        print(" [3] Scan/Mine DPI SNI Pairs")
+        print(" [4] SNI Scanner (Carrier Discovery)")
+        print(" [5] Change Proxy Port")
+        print(" [6] Clear Routing Cache")
+        print(" [s] SOCKS5 Proxy Scanner")
+        print(" [h] HTTP-Only Proxy Scanner")
+        print(" [c] Install MMDF CA (Meet / YouTube)")
+        print("\n" + color_text(" Launch", "launch"))
+        print(" [d] Start Proxy (DPI Desync)")
+        print(" [m] Start Proxy (Mixed)")
+        print("\n" + color_text(" Navigation", "nav"))
+        print(" [x] Switch to IROpenRelayFinder Mode")
+        print(" [0] Exit")
+        return
+
+    print(color_text(" IROPENRELAYFINDER MODE", "mode_white"))
     print(" [1] Scan Targets and Build IP Pool")
     print(" [2] Reload IP Pool from Latest Scan")
     print(" [3] Instant Connect (Load IPs without scan)")
@@ -123,6 +153,7 @@ def print_main_menu(ui_mode="white"):
     print(" [9] Manage Routing Rules (Whitelist/Blacklist)")
     print(" [s] SOCKS5 Proxy Scanner")
     print(" [h] HTTP-Only Proxy Scanner")
+    print(" [c] Install MMDF CA (Meet / YouTube)")
     print("\n" + color_text(" Launch", "launch"))
     print(" [w] Start Proxy (White Routing)")
     print("\n" + color_text(" Navigation", "nav"))

@@ -171,29 +171,44 @@ async def health_checker():
     await asyncio.sleep(30) 
     
     async def _verify_batch(items):
-        """Verify a list of (ip, domain) tuples concurrently, return [(ip, domain, alive_bool)]"""
+        """Verify a list of (ip, domain) tuples concurrently, return reason-aware outcomes."""
         sem = asyncio.Semaphore(30)
         async def _check(endpoint, domain):
             async with sem:
                 parsed = helpers.parse_ip_port(endpoint)
                 if not parsed:
-                    return endpoint, domain, False
+                    return endpoint, domain, False, "parse-error", 0.0
                 ip, port = parsed
                 if domain:
-                    alive = bool(await ROUTE_SERVICE.verify_sni(ip, domain, port, timeout=config.RACE_TIMEOUT))
-                    return (ip, port), domain, alive
+                    result, latency_ms, reason = await ROUTE_SERVICE.verify_sni(
+                        ip,
+                        domain,
+                        port,
+                        timeout=config.RACE_TIMEOUT,
+                        http_verify=True,
+                        return_reason=True,
+                    )
+                    return (ip, port), domain, bool(result), reason, float(latency_ms)
                 else:
                     for d in config.DEFAULT_DOMAINS:
-                        if await ROUTE_SERVICE.verify_sni(ip, d, port, timeout=config.RACE_TIMEOUT):
-                            return (ip, port), d, True
-                    return (ip, port), None, False
+                        result, latency_ms, reason = await ROUTE_SERVICE.verify_sni(
+                            ip,
+                            d,
+                            port,
+                            timeout=config.RACE_TIMEOUT,
+                            http_verify=True,
+                            return_reason=True,
+                        )
+                        if result:
+                            return (ip, port), d, True, reason, float(latency_ms)
+                    return (ip, port), None, False, "no-match", 0.0
                     
         tasks = [asyncio.create_task(_check(ep, d)) for ep, d in items]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         valid_results = []
         for r in results:
-            if isinstance(r, tuple) and len(r) == 3:
+            if isinstance(r, tuple) and len(r) == 5:
                 valid_results.append(r)
         return valid_results
 
@@ -207,7 +222,7 @@ async def health_checker():
             if STATE.ip_pool():
                 pool_copy = list(STATE.ip_pool().items())
                 results = await _verify_batch(pool_copy)
-                for ip, test_domain, is_alive in results:
+                for ip, test_domain, is_alive, reason, latency_ms in results:
                     if is_alive:
                         STATE.ip_pool()[ip] = test_domain
                     elif ip in STATE.ip_pool():
@@ -218,7 +233,7 @@ async def health_checker():
             if STATE.dead_ip_pool():
                 dead_copy = list(STATE.dead_ip_pool().items())
                 results = await _verify_batch(dead_copy)
-                for ip, test_domain, is_alive in results:
+                for ip, test_domain, is_alive, reason, latency_ms in results:
                     if is_alive and ip in STATE.dead_ip_pool():
                         STATE.ip_pool()[ip] = test_domain
                         del STATE.dead_ip_pool()[ip]
@@ -245,22 +260,26 @@ async def health_checker():
                         for port, ip in port_map.items():
                             w_items.append(((ip, port), base_domain.lstrip('.')))
                 results = await _verify_batch(w_items)
-                for endpoint, test_domain, is_alive in results:
-                    if not is_alive:
+                for endpoint, test_domain, is_alive, reason, latency_ms in results:
+                    if not is_alive and test_domain:
                         ep_ip, ep_port = endpoint
-                        base_domain = f".{test_domain}"
-                        port_map = STATE.wildcard_routes().get(base_domain)
-                        if isinstance(port_map, dict):
-                            port_map.pop(ep_port, None)
-                            if not port_map:
-                                STATE.wildcard_routes().pop(base_domain, None)
-                        exact_map = STATE.exact_routes().get(test_domain)
-                        if isinstance(exact_map, dict):
-                            exact_map.pop(ep_port, None)
-                            if not exact_map:
-                                STATE.exact_routes().pop(test_domain, None)
+                        ROUTE_SERVICE.mark_route_dead(
+                            test_domain,
+                            ep_port,
+                            endpoint,
+                            reason=reason,
+                            latency_ms=latency_ms,
+                        )
+                        if "http-reject" in str(reason).lower():
+                            try:
+                                STATE.add_ban(test_domain, endpoint)
+                                base_domain = helpers.get_base_domain(test_domain)
+                                if base_domain and base_domain != test_domain:
+                                    STATE.add_ban(base_domain, endpoint)
+                            except Exception:
+                                pass
                         routes_changed = True
-                        print(f"[HEALTH] Removed dead route: {base_domain} -> {helpers.format_ip_port(ep_ip, ep_port)}")
+                        print(f"[HEALTH] Removed dead route: {test_domain} -> {helpers.format_ip_port(ep_ip, ep_port)}")
 
             # Check Exact Routes
             if STATE.exact_routes():
@@ -277,14 +296,24 @@ async def health_checker():
                         
                 if e_items:
                     results = await _verify_batch(e_items)
-                    for endpoint, clean_domain, is_alive in results:
-                        if not is_alive:
+                    for endpoint, clean_domain, is_alive, reason, latency_ms in results:
+                        if not is_alive and clean_domain:
                             ep_ip, ep_port = endpoint
-                            port_map = STATE.exact_routes().get(clean_domain)
-                            if isinstance(port_map, dict):
-                                port_map.pop(ep_port, None)
-                                if not port_map:
-                                    STATE.exact_routes().pop(clean_domain, None)
+                            ROUTE_SERVICE.mark_route_dead(
+                                clean_domain,
+                                ep_port,
+                                endpoint,
+                                reason=reason,
+                                latency_ms=latency_ms,
+                            )
+                            if "http-reject" in str(reason).lower():
+                                try:
+                                    STATE.add_ban(clean_domain, endpoint)
+                                    base_domain = helpers.get_base_domain(clean_domain)
+                                    if base_domain and base_domain != clean_domain:
+                                        STATE.add_ban(base_domain, endpoint)
+                                except Exception:
+                                    pass
                             routes_changed = True
                             print(f"[HEALTH] Removed dead route: {clean_domain} -> {helpers.format_ip_port(ep_ip, ep_port)}")
 
@@ -303,16 +332,13 @@ async def health_checker():
 # LATENCY ROUTE PRE-WARMER
 # ==========================================
 async def prewarm_routes():
-    """Forces initial races for essential domains immediately on startup."""
-    PREWARM_DOMAINS = ['meet.google.com', 'www.youtube.com', 'meet.turns.goog']
-    target_port = config.primary_target_port()
-    print("[PREWARM] Pre-warming routes for latency-sensitive domains...")
-    
-    for domain in PREWARM_DOMAINS:
-        if domain not in STATE.exact_routes():
-            ip = await ROUTE_SERVICE.get_routed_ip(domain, target_port)
-            print(f"[PREWARM] {domain} -> {helpers.format_ip_port(ip, target_port) if ip else 'unresolved'}")
-        await asyncio.sleep(0.5)
+    """No-op placeholder.
+
+    Meet/YouTube are now routed through the MMDF engine, so the previous
+    Meet/YouTube prewarm list no longer applies. Kept as an awaitable to
+    preserve white_core's task orchestration shape.
+    """
+    return
 
 # ==========================================
 # === END OF FILE ===

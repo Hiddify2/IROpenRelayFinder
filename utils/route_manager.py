@@ -7,31 +7,27 @@ import ssl
 import re
 import fnmatch
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from utils import config
 from utils import paths
 from utils import storage
+from utils import data_store
 from utils.runtime_state import STATE
-from utils.helpers import get_base_domain, parse_ip_port, format_ip_port
-from cores.scanner import classify_response
+from utils.helpers import get_base_domain, parse_ip_port, format_ip_port, add_ban_entry
+from cores.scanner import probe_route_endpoint
 
 # ==========================================
 # GLOBAL CACHES & TUPLES (PERFORMANCE)
 # ==========================================
 _TLS_CTX_STRICT = None
 
-_CACHED_VIDEO_TUPLE = None
 _HAS_TO_THREAD = hasattr(asyncio, "to_thread")  # Cached once – never changes at runtime
 _LOCKS_INITIALIZED = False
-_SENSITIVE_DOMAINS = ('google.com', 'youtube.com', 'googlevideo.com', 'gvt1.com', 'ytimg.com', 'ggpht.com', 'turns.goog', 'chatgpt.com', 'openai.com', 'claude.ai')
+_SENSITIVE_DOMAINS = ('google.com', 'chatgpt.com', 'openai.com', 'claude.ai', 'notebooklm.google.com')
 _SENSITIVE_TUPLE = tuple('.' + d for d in _SENSITIVE_DOMAINS)
-_MEDIA_DOMAINS_TO_UNBAN = ('googlevideo.com', 'youtube.com', 'ytimg.com', 'gvt1.com', 'yt.be', 'ggpht.com', 'turns.goog')
-_MEDIA_DOMAINS_TUPLE = tuple('.' + d for d in _MEDIA_DOMAINS_TO_UNBAN)
 _PROBE_EXCLUDED_SUBDOMAINS = (
     'fonts.googleapis.com',
-    'fonts.gstatic.com',
-    'www.gstatic.com',
     'apis.google.com',
 )
 _ROUTE_POLICY_CACHE_VERSION = -1
@@ -41,26 +37,560 @@ _ROUTE_POLICY_CACHE = {
 }
 _MAX_PRIMARY_CANDIDATES_DEFAULT = 12
 _MAX_PRIMARY_CANDIDATES_SENSITIVE = 15
-_MAX_PRIMARY_CANDIDATES_VIDEO = 24
 _MAX_FALLBACK_CANDIDATES = 6
+_HOST_HTTP_REVERIFY = (
+    "gemini.google.com",
+    "bard.google.com",
+    "aistudio.google.com",
+    "ai.google.dev",
+    "notebooklm.google.com",
+)
+_HOST_VERIFY_CACHE = {}
+_HOST_VERIFY_PASS_TTL_SEC = 75.0
+_HOST_VERIFY_FAIL_TTL_SEC = 20.0
+
+# Router debug session state (lightweight counters + per-domain stats)
+_ROUTER_SESSION = {
+    'start_ts': time.time(),
+    'requests': 0,
+    'hot_starts': 0,
+    'cold_starts': 0,
+    'l1_hits': 0,
+    'l2_hits': 0,
+    'native_wins': 0,
+    'white_wins': 0,
+    'race_started': 0,
+    'race_wins': 0,
+    'race_failures': 0,
+    'reroutes': 0,
+    'mark_dead': 0,
+    'mark_slow': 0,
+    'reverify_failures': 0,
+    'race_time_ms': [],
+    'reroute_time_ms': [],
+    'selected_latency_ms': [],
+    'domains': {},
+    'logs': [],
+}
+
+
+def _normalize_route_domain(domain):
+    return (domain or "").strip().lower().strip(".")
+
+
+def _validate_server_hostname(server_hostname):
+    host = _normalize_route_domain(server_hostname)
+    if not host or len(host) > 253:
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    try:
+        host.encode("idna")
+    except UnicodeError:
+        return None
+    for label in host.split("."):
+        if not label or len(label) > 63:
+            return None
+        if label.startswith("-") or label.endswith("-"):
+            return None
+    return host
+
+
+def _default_domain_state():
+    return {
+        'ewma_latency_ms': 9999.0,
+        'fail_count': 0,
+        'last_ok_ts': 0.0,
+        'success_count': 0,
+        'consecutive_failures': 0,
+        'last_fail_ts': 0.0,
+        'last_fail_reason': "",
+        'quarantine_ts': 0.0,
+        'quarantine_reason': "",
+        'quarantine_until': 0.0,
+        'quarantine_count': 0,
+        'last_quarantine_duration_sec': 0.0,
+        'last_quarantine_ts': 0.0,
+    }
+
+
+def _route_probe_timeout_cap_sec():
+    max_race_ms = getattr(config, "ROUTE_MAX_RACE_MS", None)
+    if max_race_ms is None:
+        max_race_ms = int(float(getattr(config, "RACE_TIMEOUT", 8.0)) * 1000.0)
+    try:
+        max_race_ms = float(max_race_ms)
+    except (TypeError, ValueError):
+        max_race_ms = float(getattr(config, "RACE_TIMEOUT", 8.0)) * 1000.0
+    return max(0.1, max_race_ms / 1000.0)
+
+
+def _bounded_route_probe_timeout(timeout):
+    cap = _route_probe_timeout_cap_sec()
+    if timeout is None:
+        return cap
+    try:
+        requested = float(timeout)
+    except (TypeError, ValueError):
+        return cap
+    return max(0.1, min(requested, cap))
+
+
+async def _close_stream_writer(writer, timeout=None):
+    if writer is None:
+        return
+    try:
+        writer.close()
+    except Exception:
+        pass
+    wait_closed = getattr(writer, "wait_closed", None)
+    if wait_closed is None:
+        return
+    try:
+        await asyncio.wait_for(wait_closed(), timeout=_bounded_route_probe_timeout(timeout))
+    except Exception:
+        pass
+
+
+def _quarantine_reason_kind(reason: str):
+    rl = _normalize_failure_reason(reason)
+    if "connect-error" in rl or "connect-failed" in rl or "connection error" in rl:
+        return "connect-error"
+    if "timeout" in rl:
+        return "timeout"
+    if "tls-error" in rl or "ssl error" in rl:
+        return "tls-error"
+    if "http-reject" in rl or "reject" in rl:
+        return "http-reject"
+    return "generic"
+
+
+def _compute_quarantine_ttl(reason, state=None, requested_ttl=None):
+    rl = _normalize_failure_reason(reason)
+    if _is_soft_perf_failure_reason(rl):
+        return 0.0
+    if "http-reject" in rl or "reject" in rl:
+        return 0.0
+
+    kind = _quarantine_reason_kind(rl)
+    if kind == "connect-error":
+        base_ttl = float(getattr(config, "ROUTE_QUARANTINE_CONNECT_BASE_SEC", 600.0))
+    elif kind == "tls-error":
+        base_ttl = float(getattr(config, "ROUTE_QUARANTINE_TLS_BASE_SEC", 900.0))
+    elif kind == "timeout":
+        base_ttl = float(getattr(config, "ROUTE_QUARANTINE_TIMEOUT_BASE_SEC", 600.0))
+    else:
+        base_ttl = float(getattr(config, "ROUTE_QUARANTINE_SEVERE_BASE_SEC", 300.0))
+
+    state = state or {}
+    quarantine_count = int(state.get("quarantine_count", 0))
+    exp_cap = int(getattr(config, "ROUTE_QUARANTINE_BACKOFF_CAP", 8))
+    backoff_exp = max(0, min(quarantine_count, exp_cap))
+    ttl_s = base_ttl * (2.0 ** backoff_exp)
+    ttl_s = min(ttl_s, float(getattr(config, "ROUTE_QUARANTINE_BACKOFF_MAX_SEC", 86400.0)))
+    if requested_ttl is not None:
+        try:
+            ttl_s = max(ttl_s, float(requested_ttl))
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, ttl_s)
+
+
+def _apply_quarantine_state(state, reason, now_mono, ttl_s):
+    state["quarantine_ts"] = now_mono
+    state["quarantine_until"] = now_mono + ttl_s if ttl_s > 0 else 0.0
+    state["quarantine_reason"] = (reason or "").strip().lower()
+    state["last_quarantine_ts"] = now_mono
+    state["last_quarantine_duration_sec"] = float(ttl_s)
+    state["quarantine_count"] = max(0, int(state.get("quarantine_count", 0))) + 1
+    return state
 
 
 @dataclass
 class EndpointStats:
-    ewma_latency_ms: float = 9999.0
-    fail_count: int = 0
-    last_ok_ts: float = 0.0
-    success_count: int = 0
+    domain_state: dict = field(default_factory=dict)
 
-    def score(self, now=None):
+    def _domain_key(self, domain):
+        return _normalize_route_domain(domain)
+
+    def _state(self, domain, create=True):
+        key = self._domain_key(domain)
+        if not key:
+            return None
+        state = self.domain_state.get(key)
+        if state is None and create:
+            state = _default_domain_state()
+            self.domain_state[key] = state
+        return state
+
+    def is_quarantined(self, now=None, domain=None):
         now_mono = now if now is not None else time.monotonic()
-        recency_age = max(0.0, now_mono - self.last_ok_ts) if self.last_ok_ts else getattr(config, 'ROUTE_SCORE_RECENCY_CAP_SEC', 120.0)
-        recency_penalty = min(recency_age, getattr(config, 'ROUTE_SCORE_RECENCY_CAP_SEC', 120.0)) * getattr(config, 'ROUTE_SCORE_RECENCY_WEIGHT', 3.0)
+        state = self._state(domain, create=False)
+        if not state:
+            return False
+        quarantine_until = float(state.get("quarantine_until", 0.0) or 0.0)
+        if quarantine_until > 0.0:
+            if now_mono <= quarantine_until:
+                return True
+            state["quarantine_ts"] = 0.0
+            state["quarantine_until"] = 0.0
+            state["quarantine_reason"] = ""
+            state["consecutive_failures"] = 0
+            return False
+
+        if not state.get("quarantine_ts"):
+            return False
+
+        ttl_s = _compute_quarantine_ttl(state.get("quarantine_reason", ""), state=state)
+        if ttl_s <= 0:
+            state["quarantine_ts"] = 0.0
+            state["quarantine_until"] = 0.0
+            state["quarantine_reason"] = ""
+            state["consecutive_failures"] = 0
+            return False
+
+        if now_mono > (state["quarantine_ts"] + ttl_s):
+            state["quarantine_ts"] = 0.0
+            state["quarantine_until"] = 0.0
+            state["quarantine_reason"] = ""
+            state["consecutive_failures"] = 0
+            return False
+        return True
+
+    def quarantine(self, domain, reason: str, ttl: float | None = None, now=None):
+        now_mono = now if now is not None else time.monotonic()
+        state = self._state(domain, create=True)
+        if state is None:
+            return None
+        ttl_s = _compute_quarantine_ttl(reason, state=state, requested_ttl=ttl)
+        if ttl_s <= 0:
+            return state
+        _apply_quarantine_state(state, reason, now_mono, ttl_s)
+        return state
+
+    def clear_quarantine(self, domain):
+        state = self._state(domain, create=False)
+        if not state:
+            return
+        state["quarantine_ts"] = 0.0
+        state["quarantine_until"] = 0.0
+        state["quarantine_reason"] = ""
+
+    def score(self, now=None, domain=None, endpoint=None):
+        now_mono = now if now is not None else time.monotonic()
+        state = self._state(domain, create=False)
+        if self.is_quarantined(now_mono, domain=domain):
+            return float("inf")
+
+        if not state:
+            if endpoint is not None:
+                known_latency = _endpoint_known_latency_ms(endpoint)
+                latency_penalty = known_latency if known_latency is not None else getattr(config, "ROUTE_SCORE_NEUTRAL_LATENCY_MS", 700.0)
+            else:
+                latency_penalty = getattr(config, "ROUTE_SCORE_NEUTRAL_LATENCY_MS", 700.0)
+        else:
+            latency_penalty = state.get("ewma_latency_ms", 9999.0)
+            if latency_penalty >= 9999.0:
+                if endpoint is not None:
+                    known_latency = _endpoint_known_latency_ms(endpoint)
+                    latency_penalty = known_latency if known_latency is not None else getattr(config, "ROUTE_SCORE_NEUTRAL_LATENCY_MS", 700.0)
+                else:
+                    latency_penalty = getattr(config, "ROUTE_SCORE_NEUTRAL_LATENCY_MS", 700.0)
+
+        fail_penalty = min(
+            max(0, state.get("fail_count", 0) if state else 0),
+            getattr(config, "ROUTE_SCORE_FAIL_CAP", 8),
+        ) * getattr(config, 'ROUTE_SCORE_FAIL_WEIGHT', 250.0)
+
+        recency_penalty = 0.0
+        if state and state.get("success_count", 0) > 0 and state.get("last_ok_ts", 0.0) > 0:
+            recency_age = max(0.0, now_mono - state["last_ok_ts"])
+            recency_penalty = min(
+                recency_age,
+                getattr(config, 'ROUTE_SCORE_RECENCY_CAP_SEC', 120.0),
+            ) * getattr(config, 'ROUTE_SCORE_RECENCY_WEIGHT', 3.0)
         return (
-            (self.ewma_latency_ms * getattr(config, 'ROUTE_SCORE_LATENCY_WEIGHT', 1.0))
-            + (self.fail_count * getattr(config, 'ROUTE_SCORE_FAIL_WEIGHT', 250.0))
+            (latency_penalty * getattr(config, 'ROUTE_SCORE_LATENCY_WEIGHT', 1.0))
+            + fail_penalty
             + recency_penalty
         )
+
+
+def _router_debug_enabled():
+    return bool(getattr(config, 'ROUTER_DEBUG', False))
+
+
+def router_debug_log(host, message, include_ts=False):
+    if not _router_debug_enabled():
+        return
+    host_label = (host or '?').strip()
+    ts_unix = time.time()
+    ts = time.strftime('%Y-%m-%d %H:%M:%S') if include_ts else None
+    _ROUTER_SESSION['logs'].append({
+        'ts': ts_unix,
+        'host': host_label,
+        'message': message,
+    })
+    if ts:
+        print(f"[ROUTER-DEBUG] {host_label} | {ts} | {message}")
+    else:
+        print(f"[ROUTER-DEBUG] {host_label} | {message}")
+
+
+def _session_domain_stats(host):
+    host_key = (host or '').strip().lower() or '?'
+    stats = _ROUTER_SESSION['domains'].get(host_key)
+    if stats is None:
+        stats = {
+            'requests': 0,
+            'hot_starts': 0,
+            'cold_starts': 0,
+            'l1_hits': 0,
+            'l2_hits': 0,
+            'race_wins': 0,
+            'failures': 0,
+            'last_choice': None,
+        }
+        _ROUTER_SESSION['domains'][host_key] = stats
+    return stats
+
+
+def _session_record_request(host, hot_start):
+    _ROUTER_SESSION['requests'] += 1
+    if hot_start:
+        _ROUTER_SESSION['hot_starts'] += 1
+    else:
+        _ROUTER_SESSION['cold_starts'] += 1
+    dom = _session_domain_stats(host)
+    dom['requests'] += 1
+    if hot_start:
+        dom['hot_starts'] += 1
+    else:
+        dom['cold_starts'] += 1
+
+
+def _session_record_cache_hit(host, cache_kind):
+    if cache_kind == 'l1':
+        _ROUTER_SESSION['l1_hits'] += 1
+    elif cache_kind == 'l2':
+        _ROUTER_SESSION['l2_hits'] += 1
+    dom = _session_domain_stats(host)
+    if cache_kind == 'l1':
+        dom['l1_hits'] += 1
+    elif cache_kind == 'l2':
+        dom['l2_hits'] += 1
+
+
+def _session_record_race(host, duration_ms=None, winner=None):
+    _ROUTER_SESSION['race_started'] += 1
+    if duration_ms is not None:
+        _ROUTER_SESSION['race_time_ms'].append(float(duration_ms))
+    if winner:
+        _ROUTER_SESSION['race_wins'] += 1
+        dom = _session_domain_stats(host)
+        dom['race_wins'] += 1
+        dom['last_choice'] = winner
+    else:
+        _ROUTER_SESSION['race_failures'] += 1
+
+
+def _session_record_selection(host, winner, latency_ms=None):
+    if winner:
+        dom = _session_domain_stats(host)
+        dom['last_choice'] = winner
+    if latency_ms is not None:
+        _ROUTER_SESSION['selected_latency_ms'].append(float(latency_ms))
+
+
+def _session_record_failure(host):
+    dom = _session_domain_stats(host)
+    dom['failures'] += 1
+
+
+def _session_record_reroute(duration_ms=None):
+    _ROUTER_SESSION['reroutes'] += 1
+    if duration_ms is not None:
+        _ROUTER_SESSION['reroute_time_ms'].append(float(duration_ms))
+
+
+def record_reroute(duration_ms=None):
+    _session_record_reroute(duration_ms=duration_ms)
+
+
+def _session_record_mark(kind):
+    if kind == 'dead':
+        _ROUTER_SESSION['mark_dead'] += 1
+    elif kind == 'slow':
+        _ROUTER_SESSION['mark_slow'] += 1
+
+
+def _session_record_native_win():
+    _ROUTER_SESSION['native_wins'] += 1
+
+
+def _session_record_white_win():
+    _ROUTER_SESSION['white_wins'] += 1
+
+
+def _session_record_reverify_failure():
+    _ROUTER_SESSION['reverify_failures'] += 1
+
+
+def _fmt_ms(values):
+    if not values:
+        return "n/a"
+    avg = sum(values) / max(1, len(values))
+    return f"{avg:.1f}ms"
+
+
+def _fmt_ms_value(values):
+    if not values:
+        return None
+    return float(sum(values) / max(1, len(values)))
+
+
+def _serialize_choice(choice):
+    if isinstance(choice, tuple) and len(choice) >= 2:
+        return format_ip_port(choice[0], choice[1])
+    return choice
+
+
+def get_router_session_report():
+    now = time.time()
+    uptime = max(0.0, now - _ROUTER_SESSION['start_ts'])
+    requests = _ROUTER_SESSION['requests']
+    hot = _ROUTER_SESSION['hot_starts']
+    cold = _ROUTER_SESSION['cold_starts']
+    l1 = _ROUTER_SESSION['l1_hits']
+    l2 = _ROUTER_SESSION['l2_hits']
+    races = _ROUTER_SESSION['race_started']
+    race_wins = _ROUTER_SESSION['race_wins']
+    race_fail = _ROUTER_SESSION['race_failures']
+    native = _ROUTER_SESSION['native_wins']
+    white = _ROUTER_SESSION['white_wins']
+    reroutes = _ROUTER_SESSION['reroutes']
+    mark_dead = _ROUTER_SESSION['mark_dead']
+    mark_slow = _ROUTER_SESSION['mark_slow']
+    reverify_fail = _ROUTER_SESSION['reverify_failures']
+
+    lines = [
+        "[ROUTER-REPORT] Routing session summary",
+        f"Uptime: {uptime:.1f}s",
+        f"Requests: {requests} (hot {hot}, cold {cold})",
+        f"Cache hits: L1 {l1}, L2 {l2}",
+        f"Races: {races} (wins {race_wins}, fails {race_fail}, avg { _fmt_ms(_ROUTER_SESSION['race_time_ms']) })",
+        f"Selections: native {native}, white {white}, avg selected latency { _fmt_ms(_ROUTER_SESSION['selected_latency_ms']) }",
+        f"Reroutes: {reroutes}, avg swap { _fmt_ms(_ROUTER_SESSION['reroute_time_ms']) }",
+        f"Health marks: dead {mark_dead}, slow {mark_slow}, reverify failures {reverify_fail}",
+    ]
+
+    if _ROUTER_SESSION['domains']:
+        top = sorted(
+            _ROUTER_SESSION['domains'].items(),
+            key=lambda item: (item[1].get('requests', 0), item[0]),
+            reverse=True,
+        )[:5]
+        lines.append("Top domains (by requests):")
+        for dom, stats in top:
+            last_choice = stats.get('last_choice')
+            last_label = format_ip_port(*last_choice) if isinstance(last_choice, tuple) else (last_choice or "-")
+            lines.append(
+                f"- {dom}: req {stats.get('requests', 0)}, hot {stats.get('hot_starts', 0)}, "
+                f"L1 {stats.get('l1_hits', 0)}, L2 {stats.get('l2_hits', 0)}, "
+                f"race wins {stats.get('race_wins', 0)}, fails {stats.get('failures', 0)}, last {last_label}"
+            )
+
+    return "\n".join(lines)
+
+
+def get_router_session_report_data():
+    now = time.time()
+    uptime = max(0.0, now - _ROUTER_SESSION['start_ts'])
+    report = {
+        'generated_ts': now,
+        'uptime_sec': uptime,
+        'requests': {
+            'total': _ROUTER_SESSION['requests'],
+            'hot': _ROUTER_SESSION['hot_starts'],
+            'cold': _ROUTER_SESSION['cold_starts'],
+        },
+        'cache_hits': {
+            'l1': _ROUTER_SESSION['l1_hits'],
+            'l2': _ROUTER_SESSION['l2_hits'],
+        },
+        'races': {
+            'started': _ROUTER_SESSION['race_started'],
+            'wins': _ROUTER_SESSION['race_wins'],
+            'fails': _ROUTER_SESSION['race_failures'],
+            'avg_ms': _fmt_ms_value(_ROUTER_SESSION['race_time_ms']),
+        },
+        'selections': {
+            'native': _ROUTER_SESSION['native_wins'],
+            'white': _ROUTER_SESSION['white_wins'],
+            'avg_selected_latency_ms': _fmt_ms_value(_ROUTER_SESSION['selected_latency_ms']),
+        },
+        'reroutes': {
+            'count': _ROUTER_SESSION['reroutes'],
+            'avg_swap_ms': _fmt_ms_value(_ROUTER_SESSION['reroute_time_ms']),
+        },
+        'health_marks': {
+            'dead': _ROUTER_SESSION['mark_dead'],
+            'slow': _ROUTER_SESSION['mark_slow'],
+            'reverify_failures': _ROUTER_SESSION['reverify_failures'],
+        },
+        'domains': {},
+        'top_domains': [],
+    }
+
+    if _ROUTER_SESSION['domains']:
+        ordered = sorted(
+            _ROUTER_SESSION['domains'].items(),
+            key=lambda item: (item[1].get('requests', 0), item[0]),
+            reverse=True,
+        )
+        for dom, stats in ordered:
+            report['domains'][dom] = {
+                'requests': stats.get('requests', 0),
+                'hot_starts': stats.get('hot_starts', 0),
+                'cold_starts': stats.get('cold_starts', 0),
+                'l1_hits': stats.get('l1_hits', 0),
+                'l2_hits': stats.get('l2_hits', 0),
+                'race_wins': stats.get('race_wins', 0),
+                'failures': stats.get('failures', 0),
+                'last_choice': _serialize_choice(stats.get('last_choice')),
+            }
+        for dom, stats in ordered[:5]:
+            report['top_domains'].append({
+                'domain': dom,
+                'requests': stats.get('requests', 0),
+                'hot_starts': stats.get('hot_starts', 0),
+                'l1_hits': stats.get('l1_hits', 0),
+                'l2_hits': stats.get('l2_hits', 0),
+                'race_wins': stats.get('race_wins', 0),
+                'failures': stats.get('failures', 0),
+                'last_choice': _serialize_choice(stats.get('last_choice')),
+            })
+
+    return report
+
+
+def write_router_session_files(report_name="report.json", logs_name="logs.json"):
+    try:
+        report_payload = get_router_session_report_data()
+        data_store.write_json(report_name, report_payload, indent=2)
+    except Exception:
+        pass
+    try:
+        logs_payload = {
+            'generated_ts': time.time(),
+            'logs': list(_ROUTER_SESSION.get('logs', [])),
+        }
+        data_store.write_json(logs_name, logs_payload, indent=2)
+    except Exception:
+        pass
 
 
 # Unified endpoint registry and host L1 route cache
@@ -89,11 +619,6 @@ _GOOGLE_FAMILY_SUFFIXES = (
     'googleapis.com',
     'googleusercontent.com',
     'gstatic.com',
-    'googlevideo.com',
-    'gvt1.com',
-    'ytimg.com',
-    'ggpht.com',
-    'turns.goog',
 )
 
 def get_tls_context(strict=True):
@@ -112,13 +637,6 @@ def get_tls_context(strict=True):
         except Exception: pass
         _TLS_CTX_STRICT = ctx
     return _TLS_CTX_STRICT
-
-def get_video_cdn_tuple():
-    global _CACHED_VIDEO_TUPLE
-    if _CACHED_VIDEO_TUPLE is None:
-        _CACHED_VIDEO_TUPLE = tuple('.' + d for d in config.VIDEO_CDN_DOMAINS)
-    return _CACHED_VIDEO_TUPLE
-
 
 def _build_policy_compiled(patterns):
     compiled = {
@@ -183,6 +701,185 @@ def _is_google_family(domain):
     return False
 
 
+def _normalize_pool_endpoint(endpoint):
+    if not endpoint:
+        return None
+    if isinstance(endpoint, tuple) and len(endpoint) >= 2:
+        try:
+            return str(endpoint[0]), int(endpoint[1])
+        except (TypeError, ValueError):
+            return None
+    parsed = parse_ip_port(endpoint)
+    if parsed:
+        return str(parsed[0]), int(parsed[1])
+    return None
+
+
+def _normalize_pool_domains(domains):
+    clean = []
+    seen = set()
+    for dom in domains or []:
+        d = (dom or "").strip().lower().strip(".")
+        if not d or d in seen:
+            continue
+        seen.add(d)
+        clean.append(d)
+    return tuple(clean)
+
+
+def _coerce_pool_latency_ms(value):
+    if value is None:
+        return None
+    try:
+        latency = float(value)
+    except (TypeError, ValueError):
+        return None
+    if latency <= 0:
+        return None
+    return latency
+
+
+def _build_pool_endpoint_meta(domains=None, latency_ms=None):
+    clean_domains = _normalize_pool_domains(domains)
+    google_verified = any(_is_google_family(dom) for dom in clean_domains)
+    google_only = bool(clean_domains) and all(_is_google_family(dom) for dom in clean_domains)
+    universal = any(not _is_google_family(dom) for dom in clean_domains)
+    return {
+        'domains': clean_domains,
+        'latency_ms': _coerce_pool_latency_ms(latency_ms),
+        'google_verified': google_verified,
+        'google_only': google_only,
+        'universal': universal,
+    }
+
+
+def _merge_pool_endpoint_meta(existing=None, domains=None, latency_ms=None):
+    existing = existing or {}
+    merged_domains = list(existing.get('domains') or [])
+    for dom in _normalize_pool_domains(domains):
+        if dom not in merged_domains:
+            merged_domains.append(dom)
+    merged_latency = _coerce_pool_latency_ms(latency_ms)
+    if merged_latency is None:
+        merged_latency = _coerce_pool_latency_ms(existing.get('latency_ms'))
+    return _build_pool_endpoint_meta(merged_domains, merged_latency)
+
+
+def _set_pool_endpoint_meta(endpoint, domains=None, latency_ms=None):
+    ep = _normalize_pool_endpoint(endpoint)
+    if not ep:
+        return None
+    meta_store = getattr(config, 'IP_POOL_METADATA', None)
+    if not isinstance(meta_store, dict):
+        meta_store = {}
+        config.IP_POOL_METADATA = meta_store
+    meta_store[ep] = _merge_pool_endpoint_meta(meta_store.get(ep), domains=domains, latency_ms=latency_ms)
+    return meta_store[ep]
+
+
+def _get_pool_endpoint_meta(endpoint):
+    ep = _normalize_pool_endpoint(endpoint)
+    if not ep:
+        return _build_pool_endpoint_meta()
+
+    meta_store = getattr(config, 'IP_POOL_METADATA', None)
+    if not isinstance(meta_store, dict):
+        meta_store = {}
+        config.IP_POOL_METADATA = meta_store
+
+    meta = meta_store.get(ep)
+    if meta is not None:
+        return meta
+
+    pool_hint = None
+    try:
+        pool_hint = getattr(config, 'IP_POOL', {}).get(ep)
+    except Exception:
+        pool_hint = None
+    if pool_hint is None:
+        try:
+            pool_hint = STATE.ip_pool().get(ep)
+        except Exception:
+            pool_hint = None
+
+    if isinstance(pool_hint, dict):
+        domains = pool_hint.get('domains')
+        latency_ms = pool_hint.get('latency_ms')
+    elif isinstance(pool_hint, (list, tuple)) and pool_hint and not isinstance(pool_hint[0], (int, float)):
+        domains = pool_hint[0]
+        latency_ms = pool_hint[1] if len(pool_hint) > 1 else None
+    elif isinstance(pool_hint, str):
+        domains = [pool_hint]
+        latency_ms = None
+    else:
+        domains = []
+        latency_ms = None
+
+    meta = _build_pool_endpoint_meta(domains=domains, latency_ms=latency_ms)
+    meta_store[ep] = meta
+    return meta
+
+
+def _endpoint_known_latency_ms(endpoint):
+    ep = _normalize_pool_endpoint(endpoint)
+    if not ep:
+        return None
+    meta = _get_pool_endpoint_meta(ep)
+    meta_latency = _coerce_pool_latency_ms(meta.get('latency_ms'))
+    return meta_latency
+
+
+def _target_candidate_priority(endpoint, target_host=None):
+    ep = _normalize_pool_endpoint(endpoint)
+    if not ep:
+        return None
+    meta = _get_pool_endpoint_meta(ep)
+    target_l = (target_host or "").strip().lower().strip(".")
+    known_latency = _endpoint_known_latency_ms(ep)
+    ultra_low = known_latency is not None and known_latency <= 800.0
+    if _is_google_family(target_l):
+        if meta.get('google_verified') and ultra_low:
+            return 0
+        if meta.get('google_verified'):
+            return 1
+        if ultra_low:
+            return 2
+        if meta.get('universal'):
+            return 3
+        return 4
+    if meta.get('universal') and ultra_low:
+        return 0
+    if meta.get('universal'):
+        return 1
+    if meta.get('google_verified'):
+        return 2
+    if ultra_low:
+        return 3
+    return 4
+
+
+def _endpoint_allowed_for_target(endpoint, target_host=None):
+    ep = _normalize_pool_endpoint(endpoint)
+    if not ep:
+        return False, 'invalid-endpoint'
+    meta = _get_pool_endpoint_meta(ep)
+    target_l = (target_host or "").strip().lower().strip(".")
+    if _is_google_family(target_l):
+        if meta.get('google_verified'):
+            return True, 'google-verified'
+        if meta.get('universal'):
+            return True, 'universal'
+    return True, 'eligible'
+
+
+def _endpoint_probe_timeout_sec(endpoint, target_host=None):
+    known_latency_ms = _endpoint_known_latency_ms(endpoint)
+    if known_latency_ms is not None:
+        headroom_ms = float(getattr(config, 'ROUTE_KNOWN_LATENCY_HEADROOM_MS', 1500.0))
+        return max(0.5, (known_latency_ms + headroom_ms) / 1000.0)
+    return float(getattr(config, 'RACE_PER_IP_TIMEOUT', 2.5))
+
+
 def _should_probe_domain(domain):
     return domain in _SENSITIVE_DOMAINS or domain.endswith(_SENSITIVE_TUPLE) or _is_google_family(domain)
 
@@ -200,26 +897,229 @@ def _get_endpoint_stats(endpoint):
     return stats
 
 
-def _record_endpoint_success(endpoint, latency_ms=None):
+def _get_endpoint_domain_state(endpoint, domain, create=True):
+    return _get_endpoint_stats(endpoint)._state(domain, create=create)
+
+
+def _endpoint_score(endpoint, now=None, domain=None, allow_quarantined=False):
+    ep = _normalize_pool_endpoint(endpoint)
+    stats = _EP_REGISTRY.get(ep) if ep else None
+    if not stats:
+        known_latency = _endpoint_known_latency_ms(ep) if ep else None
+        if known_latency is not None:
+            return float(known_latency)
+        return float(getattr(config, "ROUTE_SCORE_NEUTRAL_LATENCY_MS", 700.0))
+    if not allow_quarantined and stats.is_quarantined(now, domain=domain):
+        return float("inf")
+    return stats.score(now, domain=domain, endpoint=ep)
+
+
+def _normalize_failure_reason(reason):
+    return (reason or "").strip().lower()
+
+
+def _is_soft_perf_failure_reason(reason):
+    rl = _normalize_failure_reason(reason)
+    return (
+        "no-data" in rl
+        or rl.startswith("ttfb")
+        or rl == "slow"
+        or (" slow" in rl)
+    )
+
+
+def _failure_weight_for_reason(reason):
+    rl = _normalize_failure_reason(reason)
+    if "no-data" in rl:
+        return getattr(config, "ROUTE_NO_DATA_FAIL_WEIGHT", 4.0)
+    if "ttfb" in rl or "slow" in rl:
+        return getattr(config, "ROUTE_SLOW_FAIL_WEIGHT", 2.0)
+    if "connect-error" in rl or "connect-failed" in rl or "connection error" in rl:
+        return getattr(config, "ROUTE_CONNECT_FAIL_WEIGHT", 6.0)
+    if "timeout" in rl:
+        return getattr(config, "ROUTE_FAIL_WEIGHT_TIMEOUT", 8.0)
+    if "tls-error" in rl or "ssl error" in rl:
+        return getattr(config, "ROUTE_FAIL_WEIGHT_TLS_ERROR", 5.0)
+    if "http-reject" in rl or "rejected" in rl or "reject" in rl:
+        return getattr(config, "ROUTE_FAIL_WEIGHT_HTTP_REJECT", 4.0)
+    return getattr(config, "ROUTE_FAIL_WEIGHT_GENERIC", 3.0)
+
+
+def _is_severe_failure_reason(reason):
+    rl = _normalize_failure_reason(reason)
+    return (
+        "connect-error" in rl
+        or "connect-failed" in rl
+        or "timeout" in rl
+        or "tls-error" in rl
+        or "ssl error" in rl
+        or "http-reject" in rl
+        or "reject" in rl
+    )
+
+
+def _should_quarantine_endpoint(stats, reason, domain):
+    rl = _normalize_failure_reason(reason)
+    state = stats._state(domain, create=True)
+    if state is None:
+        return False
+    if _is_soft_perf_failure_reason(rl):
+        return False
+    if "http-reject" in rl or "reject" in rl:
+        return False
+    if _is_severe_failure_reason(rl):
+        threshold = getattr(config, "ROUTE_QUARANTINE_SEVERE_THRESHOLD", 1)
+        return state.get("consecutive_failures", 0) >= threshold
+    if "connect-error" in rl or "connect-failed" in rl or "connection error" in rl:
+        return state.get("consecutive_failures", 0) >= getattr(config, "ROUTE_QUARANTINE_CONNECT_THRESHOLD", 4)
+    if "timeout" in rl:
+        return state.get("consecutive_failures", 0) >= getattr(
+            config,
+            "ROUTE_QUARANTINE_TIMEOUT_THRESHOLD",
+            getattr(config, "ROUTE_QUARANTINE_REPEAT_TIMEOUT_THRESHOLD", 3),
+        )
+    if "tls-error" in rl or "ssl error" in rl:
+        return state.get("consecutive_failures", 0) >= getattr(config, "ROUTE_QUARANTINE_TLS_THRESHOLD", 4)
+    return state.get("fail_count", 0) >= getattr(config, "ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD", 8)
+
+
+def _quarantine_endpoint(endpoint, domain, reason, ttl=None):
     stats = _get_endpoint_stats(endpoint)
-    stats.success_count += 1
-    stats.last_ok_ts = time.monotonic()
-    stats.fail_count = max(0, stats.fail_count - 1)
+    stats.quarantine(domain, reason, ttl=ttl)
+    return stats
+
+
+def _record_endpoint_success(endpoint, domain, latency_ms=None):
+    stats = _get_endpoint_stats(endpoint)
+    state = stats._state(domain, create=True)
+    if state is None:
+        return
+    state['success_count'] += 1
+    state['last_ok_ts'] = time.monotonic()
+    state['fail_count'] = max(0, state['fail_count'] - 1)
+    state['consecutive_failures'] = 0
+    state['last_fail_reason'] = ""
+    state['last_fail_ts'] = 0.0
+    state['quarantine_count'] = max(0, int(state.get('quarantine_count', 0)) - 1)
+    stats.clear_quarantine(domain)
     key = _endpoint_key(endpoint)
     _IP_HEALTH_SCORES[key] = max(-100, _IP_HEALTH_SCORES.get(key, 0) + 3)
     if latency_ms is not None:
         alpha = getattr(config, 'ROUTE_EWMA_ALPHA', 0.35)
-        if stats.ewma_latency_ms >= 9999.0:
-            stats.ewma_latency_ms = float(latency_ms)
+        if state['ewma_latency_ms'] >= 9999.0:
+            state['ewma_latency_ms'] = float(latency_ms)
         else:
-            stats.ewma_latency_ms = (alpha * float(latency_ms)) + ((1.0 - alpha) * stats.ewma_latency_ms)
+            state['ewma_latency_ms'] = (alpha * float(latency_ms)) + ((1.0 - alpha) * state['ewma_latency_ms'])
 
 
-def _record_endpoint_failure(endpoint):
+def _record_endpoint_failure(endpoint, domain, reason=None, latency_ms=None):
     stats = _get_endpoint_stats(endpoint)
-    stats.fail_count = min(50, stats.fail_count + 1)
+    state = stats._state(domain, create=True)
+    if state is None:
+        return
+    rl = _normalize_failure_reason(reason)
+    weight = _failure_weight_for_reason(rl)
+    state['fail_count'] = min(50, state['fail_count'] + max(1, int(round(weight))))
+    if _is_soft_perf_failure_reason(rl):
+        state['consecutive_failures'] = 0
+    else:
+        state['consecutive_failures'] += 1
+    state['last_fail_reason'] = rl
+    state['last_fail_ts'] = time.monotonic()
     key = _endpoint_key(endpoint)
-    _IP_HEALTH_SCORES[key] = min(100, _IP_HEALTH_SCORES.get(key, 0) - 4)
+    _IP_HEALTH_SCORES[key] = min(100, _IP_HEALTH_SCORES.get(key, 0) - max(1, int(round(weight * 1.5))))
+
+    if _should_quarantine_endpoint(stats, rl, domain):
+        _quarantine_endpoint(endpoint, domain, rl)
+        router_debug_log(str(endpoint[0]), f"quarantine {format_ip_port(*endpoint)} ({rl or 'fail'})")
+    elif latency_ms is not None and state['ewma_latency_ms'] >= 9999.0:
+        state['ewma_latency_ms'] = float(latency_ms)
+
+
+def _purge_routes_for_endpoint(host, endpoint):
+    host_l = (host or "").strip().lower().strip(".")
+    ep = _normalize_endpoint(endpoint)
+    if not host_l or not ep:
+        return False
+    base = (get_base_domain(host_l) or host_l).strip(".").lower()
+    registrable = _get_registrable_domain(host_l)
+    return _purge_l2_route(host_l, base, registrable, ep)
+
+
+def _needs_host_http_reverify(host):
+    host_l = (host or "").strip().lower().strip(".")
+    return host_l in _HOST_HTTP_REVERIFY
+
+
+def _host_verify_cache_get(host, endpoint):
+    if not host or not endpoint:
+        return None
+    key = ((host or "").strip().lower(), str(endpoint[0]), int(endpoint[1]))
+    cached = _HOST_VERIFY_CACHE.get(key)
+    if not cached:
+        return None
+    ok, reason, exp = cached
+    if exp <= time.monotonic():
+        _HOST_VERIFY_CACHE.pop(key, None)
+        return None
+    return bool(ok), reason
+
+
+def _host_verify_cache_set(host, endpoint, ok, reason=None):
+    if not host or not endpoint:
+        return
+    ttl = _HOST_VERIFY_PASS_TTL_SEC if ok else _HOST_VERIFY_FAIL_TTL_SEC
+    key = ((host or "").strip().lower(), str(endpoint[0]), int(endpoint[1]))
+    if len(_HOST_VERIFY_CACHE) > 4096:
+        now = time.monotonic()
+        stale_keys = [k for k, (_, _, exp) in _HOST_VERIFY_CACHE.items() if exp <= now]
+        for stale_key in stale_keys[:1024]:
+            _HOST_VERIFY_CACHE.pop(stale_key, None)
+        if len(_HOST_VERIFY_CACHE) > 4096:
+            for oldest_key in list(_HOST_VERIFY_CACHE.keys())[:512]:
+                _HOST_VERIFY_CACHE.pop(oldest_key, None)
+    _HOST_VERIFY_CACHE[key] = (bool(ok), _normalize_failure_reason(reason), time.monotonic() + float(ttl))
+
+
+async def _reverify_cached_endpoint_for_host(host, endpoint, timeout):
+    cached_ok = _host_verify_cache_get(host, endpoint)
+    if cached_ok is not None:
+        ok, cached_reason = cached_ok
+        return ok, 0.0, (cached_reason or "cached")
+    host_l = _validate_server_hostname(host)
+    if not host_l:
+        return False, 0.0, "invalid-server-hostname"
+    bounded_timeout = _bounded_route_probe_timeout(timeout)
+    try:
+        result, latency_ms, reason = await asyncio.wait_for(
+            probe_route_endpoint(
+                endpoint[0],
+                host_l,
+                port=endpoint[1],
+                timeout=bounded_timeout,
+                http_verify=True,
+                return_reason=True,
+            ),
+            timeout=bounded_timeout,
+        )
+    except asyncio.TimeoutError:
+        result, latency_ms, reason = None, float(bounded_timeout) * 1000.0, "timeout"
+    except Exception:
+        result, latency_ms, reason = None, 0.0, "error"
+    probe_ok = bool(result)
+    _host_verify_cache_set(host_l, endpoint, probe_ok, reason=reason)
+    return probe_ok, latency_ms, reason
+
+
+def _ban_endpoint_for_host(host, endpoint):
+    host_l = (host or "").strip().lower().strip(".")
+    ep = _normalize_endpoint(endpoint)
+    if not host_l or not ep:
+        return
+    try:
+        add_ban_entry(host_l, ep, persist=True)
+    except Exception:
+        pass
 
 
 def _collect_pool_endpoints():
@@ -237,22 +1137,40 @@ def _collect_pool_endpoints():
 
     try:
         raw_pool = getattr(config, 'IP_POOL', [])
-        for ep in raw_pool:
-            if isinstance(ep, tuple) and len(ep) >= 2:
-                try:
-                    _push((str(ep[0]), int(ep[1])))
-                except (TypeError, ValueError):
-                    continue
-            else:
-                parsed = parse_ip_port(ep)
-                if parsed:
-                    _push(parsed)
+        if isinstance(raw_pool, dict):
+            raw_iter = raw_pool.items()
+        else:
+            raw_iter = ((ep, None) for ep in raw_pool)
+        for ep, value in raw_iter:
+            parsed = _normalize_pool_endpoint(ep)
+            if not parsed:
+                continue
+            if isinstance(value, dict):
+                _set_pool_endpoint_meta(parsed, domains=value.get('domains') or value.get('domain') or [], latency_ms=value.get('latency_ms'))
+            elif isinstance(value, (list, tuple)) and value and not isinstance(value[0], (int, float)):
+                _set_pool_endpoint_meta(parsed, domains=value[0], latency_ms=value[1] if len(value) > 1 else None)
+            elif isinstance(value, str):
+                _set_pool_endpoint_meta(parsed, domains=[value], latency_ms=None)
+            elif value is not None:
+                _set_pool_endpoint_meta(parsed, domains=[], latency_ms=value)
+            _push(parsed)
     except Exception:
         pass
 
     try:
-        for ep in STATE.ip_pool().keys():
-            _push(ep)
+        for ep, value in STATE.ip_pool().items():
+            parsed = _normalize_pool_endpoint(ep)
+            if not parsed:
+                continue
+            if isinstance(value, dict):
+                _set_pool_endpoint_meta(parsed, domains=value.get('domains') or value.get('domain') or [], latency_ms=value.get('latency_ms'))
+            elif isinstance(value, (list, tuple)) and value and not isinstance(value[0], (int, float)):
+                _set_pool_endpoint_meta(parsed, domains=value[0], latency_ms=value[1] if len(value) > 1 else None)
+            elif isinstance(value, str):
+                _set_pool_endpoint_meta(parsed, domains=[value], latency_ms=None)
+            elif value is not None:
+                _set_pool_endpoint_meta(parsed, domains=[], latency_ms=value)
+            _push(parsed)
     except Exception:
         pass
     return endpoints
@@ -304,6 +1222,16 @@ def _is_endpoint_banned_for_target(endpoint, target_port, banned_set):
     return False
 
 
+def _l1_route_peek(host, port):
+    key = (host, int(port))
+    entry = _ROUTE_L1_CACHE.get(key)
+    if not entry:
+        return None
+    if entry.get('exp', 0) <= time.monotonic():
+        return None
+    return entry
+
+
 def _l1_route_get(host, port, banned_set, force_white):
     key = (host, int(port))
     entry = _ROUTE_L1_CACHE.get(key)
@@ -326,7 +1254,19 @@ def _l1_route_get(host, port, banned_set, force_white):
         return None
 
     stats = _EP_REGISTRY.get(ep)
-    if stats and stats.fail_count >= getattr(config, 'ROUTE_EVICT_FAIL_THRESHOLD', 6):
+    domain_key = _normalize_route_domain(host)
+    if stats and stats.is_quarantined(domain=domain_key):
+        _ROUTE_L1_CACHE.pop(key, None)
+        return None
+
+    state = _get_endpoint_domain_state(ep, domain_key, create=False) or {}
+    if state and (
+        state.get('fail_count', 0) >= getattr(config, 'ROUTE_EVICT_FAIL_THRESHOLD', 6)
+        or (
+            state.get('consecutive_failures', 0) > 0
+            and _is_severe_failure_reason(state.get('last_fail_reason'))
+        )
+    ):
         _ROUTE_L1_CACHE.pop(key, None)
         return None
 
@@ -360,41 +1300,77 @@ def _fast_route_set(host, port, result):
     _l1_route_set(host, port, result)
 
 
-def _prepare_candidates(target_port, banned_for_domain, is_sensitive_host=False, is_video_domain=False, seed_endpoint=None, forbidden_eps=None):
+def _prepare_candidates(
+    target_port,
+    banned_for_domain,
+    is_sensitive_host=False,
+    seed_endpoint=None,
+    forbidden_eps=None,
+    target_host=None,
+    debug_ctx=None,
+):
     primary = []
     fallback = []
     forbidden_eps = forbidden_eps or set()
+    target_l = (target_host or "").strip().lower().strip(".")
 
     for ep in _collect_pool_endpoints_cached():
-        if ep in forbidden_eps:
+        parsed_ep = _normalize_pool_endpoint(ep)
+        if not parsed_ep:
+            continue
+        if parsed_ep in forbidden_eps:
+            if debug_ctx is not None:
+                debug_ctx.setdefault('excluded', []).append((parsed_ep, 'forbidden-by-retry'))
             continue
         if config.is_tls_port(target_port):
-            if not config.is_tls_port(ep[1]):
+            if not config.is_tls_port(parsed_ep[1]):
+                if debug_ctx is not None:
+                    debug_ctx.setdefault('excluded', []).append((parsed_ep, 'port-mismatch-non-tls'))
                 continue
-        elif ep[1] != target_port:
+        elif parsed_ep[1] != target_port:
+            if debug_ctx is not None:
+                debug_ctx.setdefault('excluded', []).append((parsed_ep, 'port-mismatch'))
             continue
 
-        if _is_endpoint_banned_for_target(ep, target_port, banned_for_domain):
-            fallback.append(ep)
+        stats = _EP_REGISTRY.get(parsed_ep)
+        if stats and stats.is_quarantined(domain=target_l):
+            if debug_ctx is not None:
+                debug_ctx.setdefault('excluded', []).append((parsed_ep, 'quarantined'))
+            continue
+
+        if _is_endpoint_banned_for_target(parsed_ep, target_port, banned_for_domain):
+            fallback.append(parsed_ep)
+            if debug_ctx is not None:
+                debug_ctx.setdefault('banned', []).append((parsed_ep, 'banned-for-domain'))
         else:
-            primary.append(ep)
+            primary.append(parsed_ep)
 
     now = time.monotonic()
-    primary.sort(key=lambda ep: (_EP_REGISTRY.get(ep).score(now) if _EP_REGISTRY.get(ep) else 99999.0, ep[0], ep[1]))
-    fallback.sort(key=lambda ep: (_EP_REGISTRY.get(ep).score(now) if _EP_REGISTRY.get(ep) else 99999.0, ep[0], ep[1]))
+
+    def _sort_key(ep, allow_quarantine=False):
+        priority = _target_candidate_priority(ep, target_l)
+        if priority is None:
+            priority = 999
+        return (
+            priority,
+            _endpoint_score(ep, now, domain=target_l, allow_quarantined=allow_quarantine),
+            ep[0],
+            ep[1],
+        )
+
+    primary.sort(key=_sort_key)
+    fallback.sort(key=_sort_key)
 
     if seed_endpoint and seed_endpoint in primary:
         primary.remove(seed_endpoint)
         primary.insert(0, seed_endpoint)
 
-    if is_video_domain:
-        max_primary = _MAX_PRIMARY_CANDIDATES_VIDEO
-    elif is_sensitive_host:
-        max_primary = _MAX_PRIMARY_CANDIDATES_SENSITIVE
-    else:
-        max_primary = _MAX_PRIMARY_CANDIDATES_DEFAULT
+    max_primary = _MAX_PRIMARY_CANDIDATES_SENSITIVE if is_sensitive_host else _MAX_PRIMARY_CANDIDATES_DEFAULT
     primary = primary[:max_primary]
     fallback = fallback[:_MAX_FALLBACK_CANDIDATES]
+    if debug_ctx is not None:
+        debug_ctx['primary'] = list(primary)
+        debug_ctx['fallback'] = list(fallback)
     return primary, fallback
 
 
@@ -418,6 +1394,23 @@ def _get_registrable_domain(domain):
     if parts[-2] in ['co', 'com', 'org', 'net', 'edu', 'gov'] and len(parts[-1]) == 2:
         return '.'.join(parts[-3:])
     return '.'.join(parts[-2:])
+
+
+# Per-registrable-domain semaphore: gates *cold race execution* so a burst of
+# subdomain requests (e.g. scontent-*.cdninstagram.com) can't fan out N races
+# in parallel against the same candidate pool and exhaust local sockets. Each
+# (host, port) still gets its own coalescing entry in config._RACE_LOCKS, so
+# winners are never shared across subdomains — only race concurrency is bounded.
+_REGISTRABLE_RACE_SEMAPHORES = {}
+
+def _get_registrable_race_semaphore(registrable):
+    key = (registrable or '').lower() or '_default'
+    sem = _REGISTRABLE_RACE_SEMAPHORES.get(key)
+    if sem is None:
+        limit = max(1, int(getattr(config, 'ROUTE_RACE_PER_REGISTRABLE_LIMIT', 2)))
+        sem = asyncio.Semaphore(limit)
+        _REGISTRABLE_RACE_SEMAPHORES[key] = sem
+    return sem
 
 def _get_port_map(route_map, key):
     port_map = route_map.get(key)
@@ -577,6 +1570,10 @@ def load_banned_routes():
 
 def load_ip_pool():
     STATE.clear_dead_ip_pool()
+    try:
+        config.IP_POOL_METADATA = {}
+    except Exception:
+        pass
     scan_files = paths.list_scan_files(include_cyclic=False)
     if not scan_files: return 0
     
@@ -595,47 +1592,15 @@ def load_ip_pool():
                 if not endpoint or endpoint in loaded_ips:
                     continue
                 domains = r.get('domains') or []
-                loaded_ips[endpoint] = domains[0] if domains else None
+                latency_ms = r.get('latency_ms')
+                clean_domains = _normalize_pool_domains(domains)
+                loaded_ips[endpoint] = clean_domains[0] if clean_domains else None
+                _set_pool_endpoint_meta(endpoint, domains=clean_domains, latency_ms=latency_ms)
         except Exception:
             pass
         
     STATE.replace_ip_pool(loaded_ips)
     return len(STATE.ip_pool())
-
-async def purge_media_wildcard_routes():
-    changed = False
-    w_routes = STATE.wildcard_routes()
-    e_routes = STATE.exact_routes()
-    b_routes = STATE.banned_routes()
-
-    for base_domain in list(w_routes.keys()):
-        clean = base_domain.lstrip('.')
-        if clean in _MEDIA_DOMAINS_TO_UNBAN or clean.endswith(_MEDIA_DOMAINS_TUPLE):
-            removed = w_routes.pop(base_domain, None)
-            e_routes.pop(clean, None)
-            print(f"[STARTUP PURGE] Removed wildcard route: {base_domain} -> {removed}")
-            changed = True
-
-    for domain in list(e_routes.keys()):
-        clean = domain.lstrip('.')
-        if clean in _MEDIA_DOMAINS_TO_UNBAN or clean.endswith(_MEDIA_DOMAINS_TUPLE):
-            removed = e_routes.pop(domain, None)
-            print(f"[STARTUP PURGE] Removed exact route: {domain} -> {removed}")
-            changed = True
-
-    for domain in list(b_routes.keys()):
-        if domain in _MEDIA_DOMAINS_TO_UNBAN or domain.endswith(_MEDIA_DOMAINS_TUPLE):
-            print(f"[STARTUP PURGE] Cleared ban list for: {domain}")
-            del b_routes[domain]
-
-    if os.path.exists(config.BANNED_ROUTES_FILE):
-        lines = storage.read_text_lines(config.BANNED_ROUTES_FILE, encoding='utf-8')
-        cleaned = [line for line in lines if not any(d in line for d in _MEDIA_DOMAINS_TO_UNBAN)]
-        storage.atomic_write_text(config.BANNED_ROUTES_FILE, "".join(f"{line}\n" for line in cleaned), encoding='utf-8')
-
-    if changed:
-        await async_rewrite_routes(e_routes, w_routes)
-        print("[STARTUP PURGE] white_routes.txt updated.")
 
 # ==========================================
 # FILE I/O WRAPPERS
@@ -698,99 +1663,34 @@ async def resolve_target(host, port):
     except Exception: 
         return host
 
-async def verify_sni(ip, domain, port=443, timeout=config.RACE_TIMEOUT, tls_only=False, http_verify=False):
-    """
-    Confirms the route by completing a strict TLS handshake against ``domain``.
-    Any cert failure (untrusted CA, hostname mismatch, expired, self-signed)
-    rejects the IP — we will not route through an endpoint we can't authenticate.
-
-    When ``http_verify`` is set the verifier also issues a small HTTP GET on the
-    open TLS connection and runs the response through the scanner's
-    ``classify_response``. This catches edge IPs that present a valid cert but
-    serve "Your client does not have permission" (403) or other CDN denials at
-    HTTP level — TLS-only verification is blind to those.
-    """
-    writer = None
+async def verify_sni(ip, domain, port=443, timeout=config.RACE_TIMEOUT, tls_only=False, http_verify=False, return_reason=False):
+    domain_l = _validate_server_hostname(domain)
+    if not domain_l:
+        if return_reason:
+            return None, 0.0, "invalid-server-hostname"
+        return False
+    bounded_timeout = _bounded_route_probe_timeout(timeout)
     try:
-        ctx = get_tls_context(strict=True) if config.is_tls_port(port) else None
-        srv_host = domain if config.is_tls_port(port) else None
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port, ssl=ctx, server_hostname=srv_host),
-            timeout=timeout
+        return await asyncio.wait_for(
+            probe_route_endpoint(
+                ip,
+                domain_l,
+                port=port,
+                timeout=bounded_timeout,
+                http_verify=http_verify,
+                tls_only=tls_only,
+                return_reason=return_reason,
+            ),
+            timeout=bounded_timeout,
         )
-
-        if http_verify and config.is_tls_port(port):
-            probe = (
-                b"GET / HTTP/1.1\r\nHost: " + domain.encode("ascii", "ignore") +
-                b"\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-                b"\r\nAccept: text/html,application/xhtml+xml"
-                b"\r\nAccept-Encoding: identity"
-                b"\r\nConnection: close\r\n\r\n"
-            )
-            try:
-                writer.write(probe)
-                await writer.drain()
-                resp_buf = bytearray()
-                # First-byte timeout is more generous than per-chunk reads —
-                # CDN edge nodes often stall a beat before responding to a
-                # cold connection.
-                first_read_deadline = max(1.5, min(float(timeout), 4.0))
-                next_read_deadline = max(0.5, min(float(timeout), 2.0))
-                header_end = -1
-                first_chunk = True
-                while True:
-                    deadline = first_read_deadline if first_chunk else next_read_deadline
-                    chunk = await asyncio.wait_for(reader.read(4096), timeout=deadline)
-                    first_chunk = False
-                    if not chunk:
-                        break
-                    resp_buf.extend(chunk)
-                    if header_end == -1:
-                        idx = resp_buf.find(b"\r\n\r\n")
-                        if idx != -1:
-                            header_end = idx + 4
-                    # Scanner.classify_response wants enough body to find
-                    # domain tokens; cap at 8 KiB to stay light.
-                    if header_end != -1 and len(resp_buf) >= header_end + 4096:
-                        break
-                    if len(resp_buf) >= 8192:
-                        break
-                # Reject only on a *definitive* HTTP-layer denial (1034 / 403
-                # permission / region block / "edge IP restricted"). If the
-                # probe just times out or returns nothing parseable, trust
-                # the TLS handshake we already completed — being too eager
-                # to reject empties the candidate pool on slow links.
-                if resp_buf:
-                    verdict = classify_response(bytes(resp_buf), domain)
-                    if verdict == 'reject':
-                        writer.close()
-                        try:
-                            await writer.wait_closed()
-                        except Exception:
-                            pass
-                        return None
-            except Exception:
-                # Probe read timed out or the peer closed early. The TLS
-                # handshake itself succeeded, so treat the IP as TLS-verified
-                # rather than rejecting outright.
-                pass
-
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        if tls_only:
-            return ip
-        return ip, port
+    except asyncio.TimeoutError:
+        if return_reason:
+            return None, float(bounded_timeout) * 1000.0, "timeout"
+        return False
     except Exception:
-        if writer is not None:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-        return None
+        if return_reason:
+            return None, 0.0, "error"
+        return False
 
 async def verify_native_target(host, port=443, timeout=config.RACE_TIMEOUT):
     """
@@ -805,19 +1705,26 @@ async def verify_native_target(host, port=443, timeout=config.RACE_TIMEOUT):
         await asyncio.gather(*task_set, return_exceptions=True)
     
     async def _attempt(candidate, srv_host=None):
+        writer = None
         try:
+            cap_timeout = _bounded_route_probe_timeout(timeout)
+            srv_host = _validate_server_hostname(srv_host) if config.is_tls_port(port) else None
+            if config.is_tls_port(port) and not srv_host:
+                return None
             # CRITICAL FIX: Use strict=True. If the ISP hijacks the connection and serves a fake cert,
             # this will throw an SSLError, correctly failing the native route and triggering the proxy.
             ctx = get_tls_context(strict=True) if config.is_tls_port(port) else None
-            _, w = await asyncio.wait_for(
+            _, writer = await asyncio.wait_for(
                 asyncio.open_connection(host=candidate, port=port, ssl=ctx, server_hostname=srv_host),
-                timeout=timeout
+                timeout=cap_timeout
             )
-            w.close()
-            await w.wait_closed()
-            return host 
+            return host
+        except asyncio.TimeoutError:
+            return None
         except Exception:
             return None
+        finally:
+            await _close_stream_writer(writer, timeout=timeout)
 
     try:
         ipaddress.ip_address(host)
@@ -849,10 +1756,27 @@ async def verify_native_target(host, port=443, timeout=config.RACE_TIMEOUT):
     return winner
 
 async def _timed_verify_sni(ep_ip: str, sni_host: str, ep_port: int, timeout: float, http_verify: bool = False):
-    t0 = time.monotonic()
-    result = await verify_sni(ep_ip, sni_host, ep_port, timeout=timeout, http_verify=http_verify)
-    latency_ms = (time.monotonic() - t0) * 1000
-    return result, latency_ms
+    sni_l = _validate_server_hostname(sni_host)
+    if not sni_l:
+        return None, 0.0, "invalid-server-hostname"
+    bounded_timeout = _bounded_route_probe_timeout(timeout)
+    try:
+        result, latency_ms, reason = await asyncio.wait_for(
+            probe_route_endpoint(
+                ep_ip,
+                sni_l,
+                port=ep_port,
+                timeout=bounded_timeout,
+                http_verify=http_verify,
+                return_reason=True,
+            ),
+            timeout=bounded_timeout,
+        )
+    except asyncio.TimeoutError:
+        result, latency_ms, reason = None, float(bounded_timeout) * 1000.0, "timeout"
+    except Exception:
+        result, latency_ms, reason = None, 0.0, "error"
+    return result, latency_ms, reason
 
 
 def _normalize_endpoint(endpoint):
@@ -889,7 +1813,7 @@ def _purge_l2_route(host_lower, base, registrable, bad_endpoint):
     return purged
 
 
-def mark_route_dead(host, port, bad_endpoint):
+def mark_route_dead(host, port, bad_endpoint, reason=None, latency_ms=None):
     """Use-time hard failure: the chosen IP failed to connect at all.
 
     Evicts the L1 cache, purges any matching exact/wildcard L2 entries that
@@ -907,19 +1831,25 @@ def mark_route_dead(host, port, bad_endpoint):
         return
 
     _ROUTE_L1_CACHE.pop((host_lower, port_int), None)
-
-    stats = _get_endpoint_stats(ep)
-    weight = max(1, int(getattr(config, 'ROUTE_CONNECT_FAIL_WEIGHT', 6)))
-    stats.fail_count = min(50, stats.fail_count + weight)
-    key = _endpoint_key(ep)
-    _IP_HEALTH_SCORES[key] = max(-100, _IP_HEALTH_SCORES.get(key, 0) - 8)
+    norm_reason = _normalize_failure_reason(reason or 'connect-error')
+    # Domain-specific bans (e.g. 403 forbidden, geoblock) must not poison the
+    # endpoint universally, otherwise viable nodes get killed for all targets.
+    if 'banned-for-domain' not in norm_reason and 'http-reject' not in norm_reason and 'reject' not in norm_reason:
+        # Use-time "dead" should immediately remove the endpoint from the healthy
+        # candidate pool to avoid repeated failures during bursts.
+        _quarantine_endpoint(ep, host_lower, norm_reason)
+    _record_endpoint_failure(ep, host_lower, reason=norm_reason, latency_ms=latency_ms)
 
     base = (get_base_domain(host_lower) or host_lower).strip('.').lower()
     registrable = _get_registrable_domain(host_lower)
     _purge_l2_route(host_lower, base, registrable, ep)
+    _session_record_mark('dead')
+    reason_label = f"reason={reason}" if reason else "reason=connect-failed"
+    latency_label = f", latency={float(latency_ms):.0f}ms" if latency_ms is not None else ""
+    router_debug_log(host_lower, f"mark dead {format_ip_port(*ep)} ({reason_label}{latency_label})")
 
 
-def mark_route_slow(host, port, bad_endpoint):
+def mark_route_slow(host, port, bad_endpoint, reason=None, ttfb_ms=None, elapsed_ms=None):
     """Use-time soft failure: the IP connected but the download stalled or
     delivered no bytes. Evict the L1 entry and demote the endpoint a little so
     the next request re-races, but leave the disk-backed maps alone — a single
@@ -935,17 +1865,44 @@ def mark_route_slow(host, port, bad_endpoint):
         return
 
     _ROUTE_L1_CACHE.pop((host_lower, port_int), None)
-    stats = _get_endpoint_stats(ep)
-    weight = max(1, int(getattr(config, 'ROUTE_SLOW_FAIL_WEIGHT', 2)))
-    stats.fail_count = min(50, stats.fail_count + weight)
-    key = _endpoint_key(ep)
-    _IP_HEALTH_SCORES[key] = max(-100, _IP_HEALTH_SCORES.get(key, 0) - 4)
+    _record_endpoint_failure(ep, host_lower, reason=reason or 'slow', latency_ms=ttfb_ms or elapsed_ms)
+    _session_record_mark('slow')
+    details = []
+    details.append(f"reason={reason or 'slow'}")
+    if ttfb_ms is not None:
+        details.append(f"ttfb={float(ttfb_ms):.0f}ms")
+    if elapsed_ms is not None:
+        details.append(f"elapsed={float(elapsed_ms):.0f}ms")
+    router_debug_log(host_lower, f"mark slow {format_ip_port(*ep)} ({', '.join(details)})")
 
 
 async def get_routed_ip(target_host, target_port, forbidden_eps=None):
     ensure_locks()
     target_host_lower = target_host.lower()
     forbidden_eps = forbidden_eps or set()
+    debug_on = _router_debug_enabled()
+    debug_ctx = {} if debug_on else None
+    fast_fallback_mode = bool(forbidden_eps)
+
+    l1_entry = _l1_route_peek(target_host_lower, target_port)
+    exact_routes = STATE.exact_routes()
+    wildcard_routes = STATE.wildcard_routes()
+    l2_hot = False
+    if exact_routes.get(target_host_lower):
+        l2_hot = True
+    else:
+        parts = target_host_lower.split('.')
+        for i in range(len(parts) - 1):
+            if wildcard_routes.get('.' + '.'.join(parts[i:])):
+                l2_hot = True
+                break
+    hot_start = bool(l1_entry or l2_hot)
+    _session_record_request(target_host_lower, hot_start)
+    router_debug_log(
+        target_host_lower,
+        f"route request port={target_port} start={'hot' if hot_start else 'cold'}",
+        include_ts=True,
+    )
     
     # 1. Localhost/IP bypass - Return fully qualified tuple natively
     if target_host_lower in ('localhost', '127.0.0.1'): return target_host_lower, target_port
@@ -953,8 +1910,6 @@ async def get_routed_ip(target_host, target_port, forbidden_eps=None):
         ipaddress.ip_address(target_host_lower)
         return target_host_lower, target_port
     except ValueError: pass
-
-    is_video_shard = target_host_lower.endswith(get_video_cdn_tuple()) and not target_host_lower.startswith('www.')
 
     base_domain = get_base_domain(target_host_lower)
     registrable_domain = _get_registrable_domain(target_host_lower)
@@ -967,17 +1922,18 @@ async def get_routed_ip(target_host, target_port, forbidden_eps=None):
     force_white = bool(matched_always)
     force_native = bool(matched_native) and not force_white
     is_sensitive_host = target_host_lower in _SENSITIVE_DOMAINS or target_host_lower.endswith(_SENSITIVE_TUPLE)
+    requires_host_reverify = bool(config.is_tls_port(target_port) and _needs_host_http_reverify(target_host_lower))
 
     if force_white and matched_native:
         print(f"[RULE] {target_host_lower} matched both lists ({matched_always} / {matched_native}) -> ALWAYS_ROUTE wins.")
 
     if force_native:
         print(f"[RULE] {target_host_lower} matched DO_NOT_ROUTE ({matched_native}) -> native route.")
+        router_debug_log(target_host_lower, f"forced native route (matched {matched_native})")
+        _session_record_native_win()
         return target_host_lower, target_port
 
     # Local dictionary mapping for tighter loops
-    exact_routes = STATE.exact_routes()
-    wildcard_routes = STATE.wildcard_routes()
     banned_for_domain = set()
     ban_lookup_keys = (registrable_domain, base_domain, target_host_lower)
     for dom_key in ban_lookup_keys:
@@ -987,6 +1943,14 @@ async def get_routed_ip(target_host, target_port, forbidden_eps=None):
             if ep and ep[1] == target_port:
                 banned_for_domain.add(ep)
 
+    if not forbidden_eps and l1_entry and l1_entry.get('mode') == 'white':
+        l1_ep = _normalize_endpoint(l1_entry.get('ep'))
+        l1_stats = _EP_REGISTRY.get(l1_ep) if l1_ep else None
+        if l1_ep and l1_stats and l1_stats.is_quarantined(domain=target_host_lower):
+            _purge_routes_for_endpoint(target_host_lower, l1_ep)
+            _ROUTE_L1_CACHE.pop((target_host_lower, int(target_port)), None)
+            fast_fallback_mode = True
+
     # 3. L1 in-memory route cache (TTL + health eviction).
     # If the caller passed forbidden_eps (a retry after a connect-time
     # failure), bypass L1 entirely and force a re-race — otherwise we'd
@@ -994,14 +1958,44 @@ async def get_routed_ip(target_host, target_port, forbidden_eps=None):
     if not forbidden_eps:
         fast_cached = _l1_route_get(target_host_lower, target_port, banned_for_domain, force_white)
         if fast_cached:
-            return fast_cached
+            if (
+                requires_host_reverify
+                and isinstance(fast_cached, tuple)
+                and len(fast_cached) >= 2
+                and not (fast_cached[0] == target_host_lower and int(fast_cached[1]) == int(target_port))
+            ):
+                verify_timeout = _endpoint_probe_timeout_sec(fast_cached, target_host_lower)
+                reverify_ok, reverify_ms, reverify_reason = await _reverify_cached_endpoint_for_host(target_host_lower, fast_cached, verify_timeout)
+                if reverify_ok:
+                    _session_record_cache_hit(target_host_lower, 'l1')
+                    _session_record_white_win()
+                    router_debug_log(target_host_lower, f"L1 cache hit -> {format_ip_port(*fast_cached)} (reverify ok)")
+                    return fast_cached
+                print(f"[*] L1 cached endpoint {format_ip_port(*fast_cached)} is geoblocked for {target_host_lower}.")
+                _record_endpoint_failure(fast_cached, target_host_lower, reason=reverify_reason, latency_ms=reverify_ms)
+                fast_fallback_mode = True
+                if "http-reject" in _normalize_failure_reason(reverify_reason):
+                    _ban_endpoint_for_host(target_host_lower, fast_cached)
+                _purge_routes_for_endpoint(target_host_lower, fast_cached)
+                banned_for_domain.add((fast_cached[0], int(fast_cached[1])))
+                _session_record_reverify_failure()
+            elif fast_cached is not None:
+                _session_record_cache_hit(target_host_lower, 'l1')
+                if isinstance(fast_cached, tuple) and len(fast_cached) >= 2:
+                    if fast_cached[0] == target_host_lower and int(fast_cached[1]) == int(target_port):
+                        _session_record_native_win()
+                        router_debug_log(target_host_lower, f"L1 cache hit -> native {target_host_lower}:{target_port}")
+                    else:
+                        _session_record_white_win()
+                        router_debug_log(target_host_lower, f"L1 cache hit -> {format_ip_port(*fast_cached)}")
+                return fast_cached
 
     # 4. L2 persistent route cache from disk-backed maps (exact + wildcard).
     # Skip the disk cache entirely on a retry — it can hold the same kind of
     # bad IP that just failed, and we want a fresh race instead of digging
     # through stale entries one at a time.
     seeded_cached_ep = None
-    if not is_video_shard and not forbidden_eps:
+    if not forbidden_eps:
         cached_ep = None
         cache_source = None
 
@@ -1041,23 +2035,64 @@ async def get_routed_ip(target_host, target_port, forbidden_eps=None):
         if cached_ep:
             ep_key = (cached_ep[0], cached_ep[1])
             ep_stats = _EP_REGISTRY.get(ep_key)
-            fail_count = ep_stats.fail_count if ep_stats else 0
-            if _is_endpoint_banned_for_target(ep_key, target_port, banned_for_domain):
+            domain_state = _get_endpoint_domain_state(ep_key, target_host_lower, create=False) or {}
+            fail_count = domain_state.get('fail_count', 0)
+            if ep_stats and ep_stats.is_quarantined(domain=target_host_lower):
+                print(f"[*] Cached endpoint {format_ip_port(*cached_ep)} is QUARANTINED for {target_host_lower}. Forcing new race...")
+                _purge_routes_for_endpoint(target_host_lower, ep_key)
+                _ROUTE_L1_CACHE.pop((target_host_lower, int(target_port)), None)
+                router_debug_log(target_host_lower, f"L2 cached endpoint {format_ip_port(*cached_ep)} rejected (quarantined)")
+                fast_fallback_mode = True
+            elif _is_endpoint_banned_for_target(ep_key, target_port, banned_for_domain):
                 print(f"[*] Cached endpoint {format_ip_port(*cached_ep)} is BANNED for {registrable_domain}. Forcing new race...")
-            elif fail_count < getattr(config, 'ROUTE_EVICT_FAIL_THRESHOLD', 6):
-                # Trust the L2 entry on the cold path. A genuinely bad cached
-                # IP is caught downstream: the proxy's connect-time failover
-                # calls mark_route_dead (purges L1+L2 and re-races), and the
-                # relay's TTFB/no-data watchdog calls mark_route_slow on the
-                # download leg. Adding a synchronous TLS+HTTP probe here was
-                # too costly on every cold cache hit.
-                print(f"[⚡ CACHED] {target_host_lower} -> {format_ip_port(*cached_ep)}")
-                _l1_route_set(target_host_lower, target_port, cached_ep)
-                return cached_ep
-            elif cache_source == 'wildcard' and is_sensitive_host and target_host_lower not in exact_routes:
-                seeded_cached_ep = ep_key
+                router_debug_log(target_host_lower, f"L2 cached endpoint {format_ip_port(*cached_ep)} rejected (banned)")
+                fast_fallback_mode = True
             else:
-                print(f"[*] Cached endpoint {format_ip_port(*cached_ep)} has poor health for {target_host_lower}. Re-racing...")
+                if requires_host_reverify:
+                    verify_timeout = _endpoint_probe_timeout_sec(ep_key, target_host_lower)
+                    reverify_ok, reverify_ms, reverify_reason = await _reverify_cached_endpoint_for_host(
+                        target_host_lower,
+                        ep_key,
+                        verify_timeout,
+                    )
+                    if reverify_ok:
+                        print(f"[⚡ CACHED] {target_host_lower} -> {format_ip_port(*cached_ep)}")
+                        _record_endpoint_success(ep_key, target_host_lower)
+                        _l1_route_set(target_host_lower, target_port, cached_ep)
+                        _session_record_cache_hit(target_host_lower, 'l2')
+                        _session_record_white_win()
+                        router_debug_log(target_host_lower, f"L2 cache hit -> {format_ip_port(*cached_ep)} (reverify ok)")
+                        return cached_ep
+                    print(f"[*] Cached endpoint {format_ip_port(*cached_ep)} is geoblocked for {target_host_lower}. Forcing new race...")
+                    _record_endpoint_failure(ep_key, target_host_lower, reason=reverify_reason, latency_ms=reverify_ms)
+                    fast_fallback_mode = True
+                    if "http-reject" in _normalize_failure_reason(reverify_reason):
+                        _ban_endpoint_for_host(target_host_lower, ep_key)
+                    _purge_routes_for_endpoint(target_host_lower, ep_key)
+                    banned_for_domain.add((ep_key[0], int(ep_key[1])))
+                    _session_record_reverify_failure()
+                    router_debug_log(target_host_lower, f"L2 cached endpoint {format_ip_port(*cached_ep)} rejected (reverify failed)")
+                elif fail_count < getattr(config, 'ROUTE_EVICT_FAIL_THRESHOLD', 6) and not (
+                    domain_state.get('consecutive_failures', 0) > 0 and _is_severe_failure_reason(domain_state.get('last_fail_reason'))
+                ):
+                    # Trust the L2 entry on the cold path. A genuinely bad cached
+                    # IP is caught downstream: the proxy's connect-time failover
+                    # calls mark_route_dead (purges L1+L2 and re-races), and the
+                    # relay's TTFB/no-data watchdog calls mark_route_slow on the
+                    # download leg. Adding a synchronous TLS+HTTP probe here was
+                    # too costly on every cold cache hit.
+                    print(f"[⚡ CACHED] {target_host_lower} -> {format_ip_port(*cached_ep)}")
+                    _l1_route_set(target_host_lower, target_port, cached_ep)
+                    _session_record_cache_hit(target_host_lower, 'l2')
+                    _session_record_white_win()
+                    router_debug_log(target_host_lower, f"L2 cache hit -> {format_ip_port(*cached_ep)}")
+                    return cached_ep
+                elif cache_source == 'wildcard' and is_sensitive_host and target_host_lower not in exact_routes:
+                    seeded_cached_ep = ep_key
+                else:
+                    print(f"[*] Cached endpoint {format_ip_port(*cached_ep)} has poor health for {target_host_lower}. Re-racing...")
+                    router_debug_log(target_host_lower, f"L2 cached endpoint {format_ip_port(*cached_ep)} rejected (fail_count={fail_count})")
+                    fast_fallback_mode = True
 
     # 5. Dedup lock + 6. resolve() staged race pipeline
     if config.is_tls_port(target_port):
@@ -1074,179 +2109,285 @@ async def get_routed_ip(target_host, target_port, forbidden_eps=None):
         future = loop.create_future()
         config._RACE_LOCKS[lock_key] = future
 
+        race_semaphore = _get_registrable_race_semaphore(registrable_domain)
         try:
-            is_video_domain = target_host_lower in config.VIDEO_CDN_DOMAINS or target_host_lower.endswith(get_video_cdn_tuple())
-            race_timeout = config.VIDEO_RACE_TIMEOUT if is_video_domain else config.RACE_TIMEOUT
-            winner_ep = None
-            is_alias_fallback = False
-
-            primary_eps = []
-            fallback_eps = []
-            if config.CONNECTION_MODE in ('white_ip', 'mixed'):
-                primary_eps, fallback_eps = _prepare_candidates(
-                    target_port,
-                    banned_for_domain,
-                    is_sensitive_host=is_sensitive_host,
-                    is_video_domain=is_video_domain,
-                    seed_endpoint=seeded_cached_ep,
-                    forbidden_eps=forbidden_eps,
-                )
-
-            sni_timeout = min(race_timeout, getattr(config, 'RACE_PER_IP_TIMEOUT', 2.5))
-            # An IP can pass TLS yet still serve 403 / Cloudflare 1034 / "edge
-            # IP restricted" at the HTTP layer for the requested hostname. We
-            # verify at HTTP level for every race candidate so those IPs lose
-            # the race instead of becoming the cached winner.
-            http_verify_enabled = bool(getattr(config, 'ROUTE_HTTP_VERIFY_RACE', True))
-
-            async def _race_batch(eps, batch_size):
-                if not eps:
-                    return None
-
-                local_batch_size = _effective_batch_size(batch_size, len(eps))
-                if local_batch_size <= 0:
-                    return None
-
-                for i in range(0, len(eps), local_batch_size):
-                    batch = eps[i:i + local_batch_size]
-                    async with config.RACE_SEMAPHORE:
-                        tasks = {
-                            asyncio.create_task(_timed_verify_sni(ep[0], target_host_lower, ep[1], timeout=sni_timeout, http_verify=http_verify_enabled)): ep
-                            for ep in batch
-                        }
-                        try:
-                            pending = set(tasks.keys())
-                            while pending:
-                                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                                for t in done:
-                                    ep = tasks[t]
-                                    try:
-                                        res, latency_ms = t.result()
-                                    except Exception:
-                                        _record_endpoint_failure(ep)
-                                        _record_race_outcome(False, float(sni_timeout) * 1000.0, sni_timeout)
-                                        continue
-                                    _record_race_outcome(bool(res), float(latency_ms), sni_timeout)
-                                    if res:
-                                        _record_endpoint_success(ep, latency_ms=latency_ms)
-                                        for p in pending:
-                                            p.cancel()
-                                        await asyncio.gather(*pending, return_exceptions=True)
-                                        return res
-                                    _record_endpoint_failure(ep)
-                        finally:
-                            for t in tasks:
-                                if not t.done():
-                                    t.cancel()
-                            await asyncio.gather(*tasks.keys(), return_exceptions=True)
-                return None
-
-            if not force_white:
-                native_task = asyncio.create_task(verify_native_target(target_host_lower, target_port, timeout=race_timeout))
-                try:
-                    done, pending = await asyncio.wait(
-                        {native_task},
-                        timeout=getattr(config, 'RACE_NATIVE_HEADSTART_SEC', 0.3),
-                        return_when=asyncio.FIRST_COMPLETED,
+            async with race_semaphore:
+                race_timeout = config.RACE_TIMEOUT
+                if fast_fallback_mode:
+                    race_timeout = min(race_timeout, float(getattr(config, 'ROUTE_FAST_FALLBACK_TIMEOUT_SEC', 2.25)))
+                winner_ep = None
+    
+                primary_eps = []
+                fallback_eps = []
+                if config.CONNECTION_MODE in ('white_ip', 'mixed'):
+                    if debug_on:
+                        score_lat = getattr(config, 'ROUTE_SCORE_LATENCY_WEIGHT', 1.0)
+                        score_fail = getattr(config, 'ROUTE_SCORE_FAIL_WEIGHT', 250.0)
+                        score_rec = getattr(config, 'ROUTE_SCORE_RECENCY_WEIGHT', 3.0)
+                        rec_cap = getattr(config, 'ROUTE_SCORE_RECENCY_CAP_SEC', 120.0)
+                        router_debug_log(
+                            target_host_lower,
+                            "candidate filters: tls-port match, banned-for-domain, forbidden-by-retry; "
+                            f"sort: target-aware priority + score=(known-latency or ewma)*{score_lat}+fail_cap*{score_fail}+recent-success*{score_rec} (cap {rec_cap}s); "
+                            "google targets prefer google-verified endpoints and low-latency candidates; "
+                            "non-google targets keep all endpoints eligible",
+                        )
+                    primary_eps, fallback_eps = _prepare_candidates(
+                        target_port,
+                        banned_for_domain,
+                        is_sensitive_host=is_sensitive_host,
+                        seed_endpoint=seeded_cached_ep,
+                        forbidden_eps=forbidden_eps,
+                        target_host=target_host_lower,
+                        debug_ctx=debug_ctx,
                     )
-                    for t in done:
+                    if debug_on:
+                        def _fmt_candidates(eps):
+                            out = []
+                            now = time.monotonic()
+                            for ep in eps:
+                                stats = _EP_REGISTRY.get(ep)
+                                state = _get_endpoint_domain_state(ep, target_host_lower, create=False) or {}
+                                score = _endpoint_score(ep, now, domain=target_host_lower)
+                                latency = state.get('ewma_latency_ms') if state else None
+                                fail_count = state.get('fail_count', 0)
+                                latency_label = f"{latency:.0f}ms" if latency is not None else "n/a"
+                                out.append(f"{format_ip_port(*ep)}(score={score:.0f},lat={latency_label},fail={fail_count})")
+                            return ", ".join(out) if out else "(none)"
+    
+                        router_debug_log(target_host_lower, f"primary candidates: {_fmt_candidates(primary_eps)}")
+                        router_debug_log(target_host_lower, f"fallback candidates: {_fmt_candidates(fallback_eps)}")
+                        if not primary_eps and not fallback_eps:
+                            router_debug_log(target_host_lower, "no candidates available from pool")
+                            if debug_ctx is not None and debug_ctx.get('banned'):
+                                router_debug_log(target_host_lower, "all usable candidates were banned or quarantined")
+                            router_debug_log(
+                                target_host_lower,
+                                "scanner trigger not available in routing path; pool must be refilled externally",
+                            )
+                    if fast_fallback_mode and fallback_eps:
+                        merged_eps = list(primary_eps)
+                        seen_eps = set(merged_eps)
+                        for ep in fallback_eps:
+                            if ep not in seen_eps:
+                                merged_eps.append(ep)
+                                seen_eps.add(ep)
+                        primary_eps = merged_eps
+                        fallback_eps = []
+                        router_debug_log(target_host_lower, "fast fallback enabled; using a single merged race list")
+    
+                # An IP can pass TLS yet still serve 403 / Cloudflare 1034 / "edge
+                # IP restricted" at the HTTP layer for the requested hostname. We
+                # verify at HTTP level for every race candidate so those IPs lose
+                # the race instead of becoming the cached winner.
+                http_verify_enabled = bool(getattr(config, 'ROUTE_HTTP_VERIFY_RACE', True))
+    
+                async def _race_batch(eps, batch_size, deadline=None):
+                    if not eps:
+                        return None
+    
+                    local_batch_size = _effective_batch_size(batch_size, len(eps))
+                    if local_batch_size <= 0:
+                        return None
+    
+                    loop = asyncio.get_running_loop()
+                    if deadline is None:
+                        deadline = loop.time() + float(race_timeout)
+                    per_ip_cap = None
+                    if fast_fallback_mode:
+                        per_ip_cap = float(getattr(config, 'ROUTE_FAST_FALLBACK_PER_IP_TIMEOUT_SEC', 1.75))
+    
+                    async def _probe_candidate(ep, probe_timeout_sec):
+                        async with config.RACE_SEMAPHORE:
+                            return await _timed_verify_sni(
+                                ep[0],
+                                target_host_lower,
+                                ep[1],
+                                timeout=probe_timeout_sec,
+                                http_verify=http_verify_enabled,
+                            )
+    
+                    inflight = {}
+                    iterator = iter(eps)
+    
+                    async def _fill_window():
+                        while len(inflight) < local_batch_size:
+                            ep = next(iterator, None)
+                            if ep is None:
+                                return
+                            probe_timeout_sec = _endpoint_probe_timeout_sec(ep, target_host_lower)
+                            if per_ip_cap is not None:
+                                probe_timeout_sec = min(probe_timeout_sec, per_ip_cap)
+                            remaining = deadline - loop.time()
+                            if remaining <= 0:
+                                return
+                            probe_timeout_sec = max(0.1, min(probe_timeout_sec, remaining))
+                            task = asyncio.create_task(_probe_candidate(ep, probe_timeout_sec))
+                            inflight[task] = (ep, probe_timeout_sec)
+    
+                    await _fill_window()
+                    try:
+                        while inflight:
+                            remaining = max(0.01, deadline - loop.time())
+                            if remaining <= 0:
+                                break
+                            done, _ = await asyncio.wait(set(inflight.keys()), timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+                            if not done:
+                                break
+                            for t in done:
+                                ep, probe_timeout_sec = inflight.pop(t, (None, None))
+                                if ep is None:
+                                    continue
+                                try:
+                                    res, latency_ms, reason = t.result()
+                                except Exception:
+                                    _record_endpoint_failure(ep, target_host_lower, reason='error')
+                                    _record_race_outcome(False, float(probe_timeout_sec) * 1000.0, probe_timeout_sec)
+                                    if debug_ctx is not None:
+                                        debug_ctx.setdefault('failures', []).append((ep, 'exception', float(probe_timeout_sec) * 1000.0))
+                                    continue
+                                _record_race_outcome(bool(res), float(latency_ms), probe_timeout_sec)
+                                if res:
+                                    _record_endpoint_success(ep, target_host_lower, latency_ms=latency_ms)
+                                    if debug_ctx is not None:
+                                        debug_ctx['winner'] = ep
+                                        debug_ctx['winner_latency_ms'] = float(latency_ms)
+                                        debug_ctx['winner_reason'] = reason
+                                    for pending_task in list(inflight.keys()):
+                                        pending_task.cancel()
+                                    await asyncio.gather(*inflight.keys(), return_exceptions=True)
+                                    return res
+                                _record_endpoint_failure(ep, target_host_lower, reason=reason, latency_ms=latency_ms)
+                                if debug_ctx is not None:
+                                    debug_ctx.setdefault('failures', []).append((ep, reason or 'reject', float(latency_ms)))
+                            await _fill_window()
+                    finally:
+                        for t in list(inflight.keys()):
+                            if not t.done():
+                                t.cancel()
+                        await asyncio.gather(*inflight.keys(), return_exceptions=True)
+                    return None
+    
+                if not force_white:
+                    native_task = asyncio.create_task(verify_native_target(target_host_lower, target_port, timeout=race_timeout))
+                    try:
+                        native_headstart_sec = float(getattr(config, 'RACE_NATIVE_HEADSTART_SEC', 0.3))
+                        if fast_fallback_mode:
+                            native_headstart_sec = min(native_headstart_sec, 0.15)
+                        done, pending = await asyncio.wait(
+                            {native_task},
+                            timeout=native_headstart_sec,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for t in done:
+                            try:
+                                native_res = t.result()
+                                if native_res:
+                                    winner_ep = native_res
+                                    print(f"[🌐 NORMAL] {target_host_lower} is accessible natively.")
+                                    router_debug_log(target_host_lower, "native route verified; skipping race")
+                            except Exception:
+                                pass
+                        if pending:
+                            for p in pending:
+                                p.cancel()
+                            await asyncio.gather(*pending, return_exceptions=True)
+                    except Exception:
                         try:
-                            native_res = t.result()
-                            if native_res:
-                                winner_ep = native_res
-                                print(f"[🌐 NORMAL] {target_host_lower} is accessible natively.")
+                            native_task.cancel()
                         except Exception:
                             pass
-                    if pending:
-                        for p in pending:
-                            p.cancel()
-                        await asyncio.gather(*pending, return_exceptions=True)
-                except Exception:
-                    try:
-                        native_task.cancel()
-                    except Exception:
-                        pass
-
-            if not winner_ep:
-                winner_ep = await _race_batch(primary_eps, getattr(config, 'RACE_BATCH_PRIMARY', 6))
-            if not winner_ep and fallback_eps:
-                print(f"[*] Primary race failed. Attempting fallback race for {target_host_lower}...")
-                winner_ep = await _race_batch(fallback_eps, getattr(config, 'RACE_BATCH_FALLBACK', 4))
-
-            # Special Alias fallback for Google APIs
-            is_turns_domain = target_host_lower == 'turns.goog' or target_host_lower.endswith('.turns.goog')
-            if not winner_ep and is_turns_domain and primary_eps:
-                print(f"[*] turns.goog direct race failed. Attempting Google SNI alias fallback for {target_host_lower}...")
-                alias_coros = [
-                    verify_sni(ep[0], 'www.google.com', ep[1], timeout=race_timeout)
-                    for ep in primary_eps[:3]
-                ]
-                async with config.RACE_SEMAPHORE:
-                    pending_alias = {asyncio.create_task(c) for c in alias_coros}
-                    try:
-                        while pending_alias and not winner_ep:
-                            done, pending_alias = await asyncio.wait(pending_alias, return_when=asyncio.FIRST_COMPLETED)
-                            for t in done:
-                                try:
-                                    res = t.result()
-                                    if res and not winner_ep:
-                                        winner_ep = res
-                                        is_alias_fallback = True
-                                except Exception:
-                                    pass
-                    finally:
-                        if pending_alias:
-                            for t in pending_alias:
-                                t.cancel()
-                            await asyncio.gather(*pending_alias, return_exceptions=True)
-                    
-            # Post-Race Routing
-            if winner_ep:
-                # Unpack tuple safely
-                if isinstance(winner_ep, tuple):
-                    winner_ip, winner_port = winner_ep
-                else:
-                    winner_ip, winner_port = winner_ep, target_port
-                    
-                winner_tuple = (winner_ip, winner_port)
-                
-                if winner_ip == target_host_lower:
-                    result = target_host_lower, target_port
-                elif is_alias_fallback:
-                    print(f"[🔄 ALIAS] {target_host_lower} -> {winner_tuple} (google.com SNI alias — Chrome verifies turns.goog TLS)")
-                    result = winner_tuple
-                else:
-                    _set_route(exact_routes, target_host_lower, winner_port, winner_ip)
-                    _record_endpoint_success(winner_tuple)
-
-                    if not is_video_shard:
+    
+                race_started = False
+                race_start = None
+                if not winner_ep:
+                    race_started = True
+                    race_start = time.monotonic()
+                    winner_ep = await _race_batch(primary_eps, getattr(config, 'RACE_BATCH_PRIMARY', 6))
+                if not winner_ep and fallback_eps:
+                    print(f"[*] Primary race failed. Attempting fallback race for {target_host_lower}...")
+                    winner_ep = await _race_batch(fallback_eps, getattr(config, 'RACE_BATCH_FALLBACK', 4))
+                if race_started:
+                    duration_ms = (time.monotonic() - race_start) * 1000.0 if race_start else None
+                    _session_record_race(target_host_lower, duration_ms=duration_ms, winner=winner_ep)
+                    if winner_ep:
+                        router_debug_log(target_host_lower, f"race completed in {duration_ms:.0f}ms")
+                    else:
+                        router_debug_log(target_host_lower, f"race failed after {duration_ms:.0f}ms")
+    
+                # Post-Race Routing
+                if winner_ep:
+                    # Unpack tuple safely
+                    if isinstance(winner_ep, tuple):
+                        winner_ip, winner_port = winner_ep
+                    else:
+                        winner_ip, winner_port = winner_ep, target_port
+    
+                    winner_tuple = (winner_ip, winner_port)
+    
+                    if winner_ip == target_host_lower:
+                        result = target_host_lower, target_port
+                        _session_record_native_win()
+                        router_debug_log(target_host_lower, f"selected native {target_host_lower}:{target_port}")
+                    else:
+                        _set_route(exact_routes, target_host_lower, winner_port, winner_ip)
+                        _record_endpoint_success(winner_tuple, target_host_lower)
+                        _session_record_white_win()
+                        chosen_latency = None
+                        if debug_ctx and debug_ctx.get('winner_latency_ms') is not None:
+                            chosen_latency = float(debug_ctx.get('winner_latency_ms'))
+                        else:
+                            state = _get_endpoint_domain_state(winner_tuple, target_host_lower, create=False) or {}
+                            if state.get('ewma_latency_ms', 9999.0) < 9999.0:
+                                chosen_latency = float(state['ewma_latency_ms'])
+                        _session_record_selection(target_host_lower, winner_tuple, latency_ms=chosen_latency)
+                        latency_label = f"{chosen_latency:.0f}ms" if chosen_latency is not None else "n/a"
+                        router_debug_log(
+                            target_host_lower,
+                            f"selected {format_ip_port(winner_ip, winner_port)} (expected latency {latency_label})",
+                        )
+    
                         wildcard_key = f".{registrable_domain}"
                         route_map = _get_port_map(wildcard_routes, wildcard_key)
                         if not route_map or winner_port not in route_map:
                             _set_route(wildcard_routes, wildcard_key, winner_port, winner_ip)
                             _set_route(exact_routes, registrable_domain, winner_port, winner_ip)
                             await async_rewrite_routes(exact_routes, wildcard_routes)
-                    print(f"[🔥 ROUTE] {target_host_lower} -> {format_ip_port(winner_ip, winner_port)}")
-                    result = winner_tuple
-            else:
-                if target_host_lower not in STATE.failed_domains():
-                    STATE.add_failed_domain(target_host_lower)
-                    await async_append_fail_log(target_host_lower)
-                    print(f"[❌ FAILED] {target_host_lower} won't open directly nor with White CDN IPs.")
-                if seeded_cached_ep:
-                    _record_endpoint_failure(seeded_cached_ep)
-                
-                # ANTI-HIJACK PROTECTION
-                if config.is_tls_port(target_port):
-                    result = None
+                        print(f"[🔥 ROUTE] {target_host_lower} -> {format_ip_port(winner_ip, winner_port)}")
+                        result = winner_tuple
                 else:
-                    result = target_host_lower, target_port
-
-            _l1_route_set(target_host_lower, target_port, result)
-                
-            if not future.done():
-                future.set_result(result)
-            return result
+                    if target_host_lower not in STATE.failed_domains():
+                        STATE.add_failed_domain(target_host_lower)
+                        await async_append_fail_log(target_host_lower)
+                        print(f"[❌ FAILED] {target_host_lower} won't open directly nor with White CDN IPs.")
+                        _session_record_failure(target_host_lower)
+                        router_debug_log(target_host_lower, "no viable endpoint found; routing failed")
+                    if seeded_cached_ep:
+                        _record_endpoint_failure(seeded_cached_ep, target_host_lower)
+                    if debug_on:
+                        failures = debug_ctx.get('failures', []) if debug_ctx else []
+                        excluded = debug_ctx.get('excluded', []) if debug_ctx else []
+                        banned = debug_ctx.get('banned', []) if debug_ctx else []
+                        if excluded or banned or failures:
+                            router_debug_log(target_host_lower, "candidate rejection summary:")
+                            for ep, reason in excluded:
+                                router_debug_log(target_host_lower, f"reject {format_ip_port(*ep)}: {reason}")
+                            for ep, reason in banned:
+                                router_debug_log(target_host_lower, f"reject {format_ip_port(*ep)}: {reason}")
+                            for ep, reason, latency_ms in failures:
+                                router_debug_log(target_host_lower, f"reject {format_ip_port(*ep)}: {reason} ({latency_ms:.0f}ms)")
+                    
+                    # ANTI-HIJACK PROTECTION
+                    if config.is_tls_port(target_port):
+                        result = None
+                    else:
+                        result = target_host_lower, target_port
+    
+                _l1_route_set(target_host_lower, target_port, result)
+                    
+                if not future.done():
+                    future.set_result(result)
+                return result
         except asyncio.CancelledError:
             if not future.done(): future.cancel()
             raise

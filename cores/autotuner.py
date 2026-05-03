@@ -58,7 +58,6 @@ from utils import config
 from utils.app_service import APP_SERVICE
 from utils.asn_engine import expand_target
 from utils.helpers import clear_screen
-import cores.ui_prompts as ui_prompts
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,7 +67,7 @@ import cores.ui_prompts as ui_prompts
 def draw_header():
     clear_screen()
     print("==================================================")
-    print(f"   IROpenRelayFinder - AUTO-TUNER v{config.VERSION} (latency-aware)")
+    print(f"   IROPENRELAYFINDER SUITE - AUTO-TUNER v{config.VERSION} (latency-aware)")
     print("==================================================")
 
 
@@ -752,6 +751,13 @@ async def _adaptive_tune(
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────────
 
+def _draw_profile_menu():
+    print("\n[?] Select your network quality:")
+    print("    [1] Good   (Fiber / low-loss / aggressive tuning)")
+    print("    [2] Normal (Decent Wi-Fi / balanced tuning) [Default]")
+    print("    [3] Shitty (High ping / loss / forgiving tuning)")
+
+
 async def run():
     """Entry point for the Auto-Tuner module."""
     has_masscan = shutil.which("masscan") is not None
@@ -808,7 +814,7 @@ async def run():
 
     if not any([tune_asyncio, tune_masscan, tune_nmap]):
         print("[-] No scanners selected for tuning.")
-        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+        input("Press Enter to return...")
         return
 
     # ── Sudo setup ─────────────────────────────────────────────────────────────
@@ -873,16 +879,8 @@ async def run():
     }
     # fmt: on
 
-    net_choice = ui_prompts.menu_choice(
-        "NETWORK PROFILE",
-        [
-            ("1", "Good", "Fiber / low-loss / aggressive tuning"),
-            ("2", "Normal", "Decent Wi-Fi / balanced tuning"),
-            ("3", "Lossy", "High ping / loss / forgiving tuning"),
-        ],
-        default="2",
-        prompt="Profile",
-    )
+    _draw_profile_menu()
+    net_choice = input("    Choice: ").strip()
     p = profiles.get(net_choice, profiles["2"])
 
     print(
@@ -904,7 +902,7 @@ async def run():
     ips = expand_target(target, silent=True)
     if not ips:
         print("[-] Invalid target or no IPs found.")
-        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+        input("Press Enter to return...")
         return
 
     ips = list(dict.fromkeys(ips))
@@ -930,7 +928,7 @@ async def run():
             f"[-] Baseline too low ({len(baseline_eps)} endpoints). "
             "Try a subnet with more active hosts."
         )
-        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+        input("Press Enter to return...")
         return
 
     print(f"[+] TCP Baseline: {len(baseline_eps)} live endpoints.")
@@ -1026,7 +1024,7 @@ async def run():
 
     print("\n[+] Auto-Tuning complete. Safe, endurance-verified rates applied.")
     APP_SERVICE.save_runtime_config()
-    ui_prompts.pause("Press Enter to return to main menu...", action_label="Return to Main Menu")
+    input("Press Enter to return to main menu...")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 """
 HTTP-Only Proxy Scanner — 3-Wave asyncio pipeline.
 
-Strictly isolated from the IROpenRelayFinder routing engine: results are saved to
+Strictly isolated from the white-proxy routing engine: results are saved to
 data/http_proxies.txt (export) and data/http_cache.txt (permanent cross-run
 cache). Neither file is read by route_manager.load_ip_pool() — those load
 scan_*.json + white_ips_cache.txt only — so verified HTTP proxies are
@@ -39,7 +39,6 @@ from cores.ui_layout import (
     color_text, print_section, print_hint, print_ok, print_warn, print_err,
     draw_header,
 )
-import cores.ui_prompts as ui_prompts
 
 # ─── Defaults ──────────────────────────────────────────────────────────────
 DEFAULT_HTTP_PORTS = [80, 8080, 3128, 8000, 8888, 8118, 8081, 8123]
@@ -385,18 +384,14 @@ async def run():
     print()
 
     # ── Source ──────────────────────────────────────────────────────────────
-    src = ui_prompts.menu_choice(
-        "SCAN SOURCE",
-        [
-            ("1", "Load IPs/CIDRs/ASNs from text file", None),
-            ("2", "Paste IPs/CIDRs/ASNs manually", None),
-            ("3", "Use Permanent HTTP proxy cache", None),
-            ("4", "Select from IranASN database", None),
-            ("0", "Back", None),
-        ],
-        default="1",
-        remember_key="http_scan.source",
-    )
+    print_section("SCAN SOURCE")
+    print(" [1] Load IPs/CIDRs/ASNs from text file")
+    print(" [2] Paste IPs/CIDRs/ASNs manually")
+    print(" [3] Use Permanent HTTP proxy cache")
+    print(" [4] Mine IPs from Cloudflare CNAMEs")
+    print(" [5] Select from IranASN database")
+    print(" [0] Back")
+    src = input("\nChoice: ").strip()
 
     raw_lines = []
 
@@ -404,28 +399,61 @@ async def run():
         fp = input("File path: ").strip()
         if not os.path.exists(fp):
             print_err("File not found.")
-            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+            input("Press Enter to return...")
             return
         with open(fp, "r") as f:
             raw_lines = [l.strip() for l in f if l.strip()]
 
     elif src == "2":
-        raw_lines = ui_prompts.read_multiline("Paste targets (empty line to finish):")
+        print("Paste targets (empty line to finish):")
+        while True:
+            line = input().strip()
+            if not line:
+                break
+            raw_lines.append(line)
 
     elif src == "3":
         cached = load_http_cache()
         if not cached:
             print_err("HTTP proxy cache is empty.")
-            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+            input("Press Enter to return...")
             return
         raw_lines = list(dict.fromkeys(ip for ip, _ in cached))
         print_hint(f"Loaded {len(raw_lines)} IPs from HTTP cache.")
 
     elif src == "4":
+        rounds_s = input("[?] DNS resolution rounds [Default 5]: ").strip()
+        rounds = int(rounds_s) if rounds_s.isdigit() else 5
+        delay_s = input("[?] Delay between rounds in seconds [Default 2]: ").strip()
+        delay = int(delay_s) if delay_s.isdigit() else 2
+
+        mined = set()
+        domains = list(config.CLOUDFLARE_CNAME_DOMAINS)
+        print_hint(f"Mining {len(domains)} Cloudflare domains over {rounds} rounds...")
+        for r in range(rounds):
+            sys.stdout.write(f"\r[*] Round {r+1}/{rounds} — IPs so far: {len(mined)}     ")
+            sys.stdout.flush()
+            random.shuffle(domains)
+            for domain in domains:
+                try:
+                    _, _, ip_list = socket.gethostbyname_ex(domain)
+                    mined.update(ip_list)
+                except Exception:
+                    pass
+            if r < rounds - 1:
+                time.sleep(delay)
+        print(f"\r{color_text('[*] Mining complete!', 'dim')} Discovered {len(mined)} IPs.            \n")
+        if not mined:
+            print_err("No IPs discovered.")
+            input("Press Enter to return...")
+            return
+        raw_lines = list(mined)
+
+    elif src == "5":
         import cores.ui_asn as ui_asn
         subnets = ui_asn.menu_search_asn()
         if not subnets:
-            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+            input("Press Enter to return...")
             return
         raw_lines = list(subnets)
 
@@ -436,33 +464,19 @@ async def run():
     ips = _expand_targets(raw_lines)
     if not ips:
         print_err("No valid IPs resolved.")
-        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+        input("Press Enter to return...")
         return
-
-    ips, dropped = asn_engine.filter_to_iranian(ips)
-    if dropped:
-        print_warn(f"{dropped} non-Iranian IP(s) were dropped (not found in IranASN database).")
-    if not ips:
-        print_err("No Iranian IPs remain after filtering.")
-        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
-        return
-    print_ok(f"{len(ips)} Iranian IP(s) queued.")
+    print_ok(f"{len(ips)} unique IP(s) queued.")
 
     # ── Ports ───────────────────────────────────────────────────────────────
-    draw_header()
+    print()
+    print_section("TARGET PORTS")
     default_str = ", ".join(str(p) for p in DEFAULT_HTTP_PORTS)
     extended_str = ", ".join(str(p) for p in EXTENDED_HTTP_PORTS)
-    port_key = ui_prompts.menu_choice(
-        "TARGET PORTS",
-        [
-            ("1", "Default HTTP ports", default_str),
-            ("2", "Extended ports", extended_str[:50] + "..."),
-            ("3", "Custom ports", None),
-        ],
-        default="1",
-        prompt="Port mode",
-        remember_key="http_scan.port_mode",
-    )
+    print(f" [1] Default HTTP ports  ({default_str})")
+    print(f" [2] Extended ports      ({extended_str[:50]}...)")
+    print(" [3] Custom ports")
+    port_key = input("\nChoice [Default 1]: ").strip()
 
     if port_key == "2":
         http_ports = list(EXTENDED_HTTP_PORTS)
@@ -476,71 +490,52 @@ async def run():
         http_ports = list(DEFAULT_HTTP_PORTS)
 
     # ── Method ──────────────────────────────────────────────────────────────
-    draw_header()
+    print()
+    print_section("SCAN METHOD")
     has_masscan = shutil.which("masscan") is not None
     has_nmap = shutil.which("nmap") is not None
 
     method_map = {"1": "asyncio"}
-    total_eps = len(ips) * len(http_ports)
-    rate_disp = config.TUNED_MASSCAN_RATE or 5000
-    method_options = [("1", "Asyncio direct", f"{total_eps} probes ({len(ips)} IPs x {len(http_ports)} ports), no extra tools")]
     opt = 2
     if has_masscan:
         method_map[str(opt)] = "masscan"
-        method_options.append((str(opt), "Masscan preflight", f"{rate_disp} pps, then 3-wave verify"))
         opt += 1
     if has_nmap:
         method_map[str(opt)] = "nmap"
-        method_options.append((str(opt), "Nmap preflight", "Reliable port scan, then 3-wave verify"))
 
-    method_key = ui_prompts.menu_choice(
-        "SCAN METHOD",
-        method_options,
-        default="1",
-        prompt="Method",
-    )
-    method = method_map.get(method_key, "asyncio")
-    ui_prompts.set_pref("http_scan.method", method)
+    total_eps = len(ips) * len(http_ports)
+    rate_disp = config.TUNED_MASSCAN_RATE or 5000
+    print(f" [1] Asyncio direct    — {total_eps} probes ({len(ips)} IPs × {len(http_ports)} ports), no extra tools")
+    if has_masscan:
+        k = next(k for k, v in method_map.items() if v == "masscan")
+        print(f" [{k}] Masscan preflight  — {rate_disp} pps, then 3-wave verify")
+    if has_nmap:
+        k = next(k for k, v in method_map.items() if v == "nmap")
+        print(f" [{k}] Nmap preflight     — reliable port scan, then 3-wave verify")
+
+    method = method_map.get(input("\nChoice [Default 1]: ").strip(), "asyncio")
 
     # ── Asyncio concurrency (only relevant for asyncio mode) ─────────────────
     w1_cap, w2_cap, w3_cap = W1_CONCURRENCY, W2_CONCURRENCY, W3_CONCURRENCY
     if method == "asyncio":
         print()
-        conc = ui_prompts.menu_choice(
-            "CONCURRENCY PROFILE",
-            [
-                ("1", "Light", "W1=500 / W2=150 / W3=40"),
-                ("2", "Normal", "W1=2000 / W2=500 / W3=100"),
-                ("3", "Aggressive", "W1=4000 / W2=1000 / W3=200"),
-                ("4", "Custom", "Enter values manually"),
-            ],
-            default="2",
-            prompt="Profile",
-            remember_key="http_scan.profile",
-        )
+        print_section("CONCURRENCY")
+        print(f" [1] Light      — W1=500  / W2=150 / W3=40  (low RAM/BW, slow networks)")
+        print(f" [2] Normal     — W1=2000 / W2=500 / W3=100  [Default]")
+        print(f" [3] Aggressive — W1=4000 / W2=1000 / W3=200 (fast, needs good uplink)")
+        print(f" [4] Custom     — enter values manually")
+        conc = input("\nChoice [Default 2]: ").strip()
         if conc == "1":
             w1_cap, w2_cap, w3_cap = 500, 150, 40
         elif conc == "3":
             w1_cap, w2_cap, w3_cap = 4000, 1000, 200
         elif conc == "4":
-            w1_cap = ui_prompts.prompt_int(
-                "  W1 TCP-ping concurrency",
-                W1_CONCURRENCY,
-                min_value=1,
-                remember_key="http_scan.custom_w1",
-            )
-            w2_cap = ui_prompts.prompt_int(
-                "  W2 proxy-aware concurrency",
-                W2_CONCURRENCY,
-                min_value=1,
-                remember_key="http_scan.custom_w2",
-            )
-            w3_cap = ui_prompts.prompt_int(
-                "  W3 fingerprint concurrency",
-                W3_CONCURRENCY,
-                min_value=1,
-                remember_key="http_scan.custom_w3",
-            )
+            w1_s = input(f"  W1 TCP-ping concurrency   [Default {W1_CONCURRENCY}]: ").strip()
+            w2_s = input(f"  W2 proxy-aware concurrency [Default {W2_CONCURRENCY}]: ").strip()
+            w3_s = input(f"  W3 fingerprint concurrency [Default {W3_CONCURRENCY}]: ").strip()
+            w1_cap = int(w1_s) if w1_s.isdigit() and int(w1_s) > 0 else W1_CONCURRENCY
+            w2_cap = int(w2_s) if w2_s.isdigit() and int(w2_s) > 0 else W2_CONCURRENCY
+            w3_cap = int(w3_s) if w3_s.isdigit() and int(w3_s) > 0 else W3_CONCURRENCY
 
     # ── Run ─────────────────────────────────────────────────────────────────
     helpers.clear_screen()
@@ -555,7 +550,7 @@ async def run():
         candidates = await _gather_candidates(method, ips, http_ports)
         if not candidates:
             print_warn("No candidate endpoints to verify.")
-            ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
+            input("\nPress Enter to return...")
             return
 
         random.shuffle(candidates)
@@ -566,8 +561,7 @@ async def run():
         working = await _run_pipeline(candidates, cache_set, w1_cap, w2_cap, w3_cap)
 
     except KeyboardInterrupt:
-        ui_prompts.clear_status_line()
-        print("\n[-] Scan interrupted.")
+        print("\n\n[-] Scan interrupted.")
 
     # ── Results ─────────────────────────────────────────────────────────────
     print()
@@ -585,8 +579,7 @@ async def run():
     else:
         print_warn("No working HTTP proxies found in the scanned range.")
 
-    ui_prompts.clear_status_line()
-    ui_prompts.pause("\nPress Enter to return to main menu...", action_label="Return to Main Menu")
+    input("\nPress Enter to return to main menu...")
 
 
 if __name__ == "__main__":

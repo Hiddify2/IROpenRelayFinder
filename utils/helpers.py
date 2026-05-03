@@ -178,7 +178,7 @@ def is_l7_geoblocked(domain, resp_bytes):
     if b"error 1034" in resp_lower: return True
     if b"fastly error: unknown domain" in resp_lower: return True
     
-    google_domains = ('google.com', 'youtube.com', 'googlevideo.com', 'gvt1.com', 'ytimg.com', 'ggpht.com', 'turns.goog')
+    google_domains = ('google.com',)
     is_google = any(domain == d or domain.endswith('.' + d) for d in google_domains)
     if is_google and (b" 403 " in status_line or b" 451 " in status_line):
         return True
@@ -187,7 +187,7 @@ def is_l7_geoblocked(domain, resp_bytes):
 
 def get_base_domain(domain):
     """Extracts the base domain from a full hostname (e.g., www.example.com -> example.com)."""
-    SENSITIVE_DOMAINS = {'google.com', 'googlevideo.com', 'youtube.com', 'gvt1.com', 'chatgpt.com', 'openai.com', 'turns.goog'}
+    SENSITIVE_DOMAINS = {'google.com', 'chatgpt.com', 'openai.com'}
     parts = domain.split('.')
     if len(parts) <= 2: base = domain
     elif parts[-2] in ['co', 'com', 'org', 'net', 'edu', 'gov'] and len(parts[-1]) == 2: base = '.'.join(parts[-3:])

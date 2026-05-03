@@ -20,7 +20,8 @@ from utils.app_service import APP_SERVICE
 from utils import app_service as app_service_module
 from utils import scan_service as scan_service_module
 from utils.scan_service import SCAN_SERVICE
-from cores.ui import _choice_from_line_click
+from cores import mmdf_engine
+from cores import white_core
 
 
 class PathsSmokeTests(unittest.TestCase):
@@ -126,7 +127,7 @@ class ScanServiceSmokeTests(unittest.TestCase):
     def test_scan_service_delegates_calls(self):
         called = {"masscan": 0, "nmap": 0, "mass": 0}
 
-        async def fake_mass_scan(ips, domains, results_list, skip_tcp=False, deep_scan=False):
+        async def fake_mass_scan(ips, domains, results_list, skip_tcp=False, deep_scan=False, pause_controller=None):
             called["mass"] += 1
             first = ips[0] if ips else ("1.1.1.1", config.primary_target_port())
             ip, port = first if isinstance(first, tuple) else (first, config.primary_target_port())
@@ -159,35 +160,21 @@ class ScanServiceSmokeTests(unittest.TestCase):
         self.assertEqual(results[0]["ip"], "1.1.1.1")
 
 
-class CursesMenuSmokeTests(unittest.TestCase):
-    def test_click_parser_handles_multidigit_bracket_choices(self):
-        line = " [10] example.com (15 IPs)"
-        self.assertEqual(_choice_from_line_click(line, 2), "10")
-        self.assertEqual(_choice_from_line_click(line, 12), "10")
-
-    def test_click_parser_handles_numbered_checklist_rows(self):
-        line = "   12. [X] AS58224 - Iran Telecommunication"
-        self.assertEqual(_choice_from_line_click(line, 30), "12")
-
-    def test_click_parser_handles_inline_command_tokens(self):
-        line = " Commands: [n] Next  [p] Previous  [0] Back"
-        self.assertEqual(_choice_from_line_click(line, line.index("[n]") + 1), "n")
-        self.assertEqual(_choice_from_line_click(line, line.index("[p]") + 1), "p")
-        self.assertEqual(_choice_from_line_click(line, line.index("[0]") + 1), "0")
-
-    def test_click_parser_handles_asn_command_tokens(self):
-        self.assertEqual(_choice_from_line_click(" [1,2,5-8] Toggle ASN selection", 2), "1,2,5-8")
-        self.assertEqual(_choice_from_line_click(" [/*pat*]   Wildcard search", 2), "/*pat*")
-        self.assertEqual(_choice_from_line_click(" [/regex:]  Regex search", 2), "/regex:")
-
-
 class RouteManagerSmokeTests(unittest.TestCase):
     def setUp(self):
         route_manager._ROUTE_FAST_CACHE.clear()
+        route_manager._ROUTE_L1_CACHE.clear()
         route_manager._IP_HEALTH_SCORES.clear()
+        route_manager._EP_REGISTRY.clear()
+        route_manager._HOST_VERIFY_CACHE.clear()
+        config.IP_POOL_METADATA.clear()
         route_manager._POOL_CACHE["expiry"] = 0.0
         route_manager._POOL_CACHE["sig"] = None
         route_manager._POOL_CACHE["eps"] = []
+        route_manager.STATE.clear_routes()
+        route_manager.STATE.clear_banned_routes()
+        route_manager.STATE.clear_dead_ip_pool()
+        config.FAILED_DOMAINS.clear()
 
     def test_verify_native_target_uses_strict_tls(self):
         seen_calls = []
@@ -224,41 +211,35 @@ class RouteManagerSmokeTests(unittest.TestCase):
         self.assertEqual(getattr(ssl_ctx, "verify_mode", None), route_manager.ssl.CERT_REQUIRED)
         self.assertTrue(getattr(ssl_ctx, "check_hostname", False))
 
-    def test_verify_native_target_returns_none_on_tls_failure(self):
-        async def fake_open_connection(_host, _port, ssl=None, server_hostname=None):
-            raise route_manager.ssl.SSLError("handshake failed")
+    def test_verify_sni_delegates_to_shared_probe_helper(self):
+        async def fake_probe(ip, domain, port=443, timeout=4.0, http_verify=True, tls_only=False, return_reason=False):
+            self.assertEqual((ip, domain, port, timeout, http_verify, tls_only, return_reason), (
+                "1.1.1.1",
+                "example.com",
+                443,
+                0.5,
+                True,
+                True,
+                True,
+            ))
+            return "1.1.1.1", 12.5, "ok"
 
-        async def fake_resolve_target(host, port):
-            self.assertEqual(host, "example.com")
-            self.assertEqual(port, 443)
-            return "93.184.216.34"
-
-        with patch.object(route_manager, "resolve_target", side_effect=fake_resolve_target), patch.object(
-            route_manager.asyncio, "open_connection", side_effect=fake_open_connection
-        ):
+        with patch.object(route_manager, "probe_route_endpoint", side_effect=fake_probe):
             import asyncio
 
-            result = asyncio.run(route_manager.verify_native_target("example.com", 443, timeout=0.5))
+            result = asyncio.run(
+                route_manager.verify_sni(
+                    "1.1.1.1",
+                    "example.com",
+                    port=443,
+                    timeout=0.5,
+                    http_verify=True,
+                    tls_only=True,
+                    return_reason=True,
+                )
+            )
 
-        self.assertIsNone(result)
-
-    def test_verify_sni_rejects_on_cert_verify_failure(self):
-        calls = []
-
-        async def fake_open_connection(host, port, ssl=None, server_hostname=None):
-            calls.append((host, port, ssl, server_hostname))
-            raise route_manager.ssl.SSLCertVerificationError("certificate verify failed")
-
-        with patch.object(route_manager.asyncio, "open_connection", side_effect=fake_open_connection):
-            import asyncio
-
-            result = asyncio.run(route_manager.verify_sni("1.1.1.1", "example.com", port=443, timeout=0.5, tls_only=True))
-
-        self.assertIsNone(result)
-        self.assertEqual(len(calls), 1)
-        strict_ctx = calls[0][2]
-        self.assertEqual(getattr(strict_ctx, "verify_mode", None), route_manager.ssl.CERT_REQUIRED)
-        self.assertTrue(getattr(strict_ctx, "check_hostname", False))
+        self.assertEqual(result, ("1.1.1.1", 12.5, "ok"))
 
     def test_fast_route_cache_returns_healthy_unbanned_endpoint(self):
         host = "api.chatgpt.com"
@@ -292,6 +273,195 @@ class RouteManagerSmokeTests(unittest.TestCase):
         route_manager._IP_HEALTH_SCORES[endpoint] = -10
         result_unhealthy = route_manager._fast_route_get(host, port, banned_set=set(), force_white=False)
         self.assertIsNone(result_unhealthy)
+
+    def test_health_score_prefers_fresh_neutral_over_stale_failures(self):
+        fresh = route_manager.EndpointStats()
+        stale = route_manager.EndpointStats()
+        stale_state = stale._state("example.com", create=True)
+        stale_state.update(
+            {
+                "ewma_latency_ms": 460.0,
+                "fail_count": 8,
+                "last_ok_ts": route_manager.time.monotonic() - 600.0,
+                "success_count": 3,
+            }
+        )
+        fresh_score = fresh.score(route_manager.time.monotonic(), domain="example.com")
+        stale_score = stale.score(route_manager.time.monotonic(), domain="example.com")
+
+        self.assertLess(fresh_score, stale_score)
+
+    def test_quarantined_endpoint_is_filtered_from_candidates(self):
+        endpoint = ("1.1.1.1", 443)
+        stats = route_manager._get_endpoint_stats(endpoint)
+        stats.quarantine("x.com", "connect-error")
+
+        with patch.object(config, "IP_POOL", [endpoint]), patch.object(
+            route_manager.STATE,
+            "ip_pool",
+            return_value={endpoint: "example.com"},
+        ):
+            route_manager._POOL_CACHE["expiry"] = 0.0
+            route_manager._POOL_CACHE["sig"] = None
+            route_manager._POOL_CACHE["eps"] = []
+            primary_x, fallback_x = route_manager._prepare_candidates(443, banned_for_domain=set(), target_host="x.com")
+            primary_g, fallback_g = route_manager._prepare_candidates(443, banned_for_domain=set(), target_host="google.com")
+
+        self.assertNotIn(endpoint, primary_x)
+        self.assertNotIn(endpoint, fallback_x)
+        self.assertIn(endpoint, primary_g)
+        self.assertNotIn(endpoint, fallback_g)
+
+    def test_quarantine_ttl_clears_reason_and_consecutive_failures(self):
+        stats = route_manager.EndpointStats()
+        state = stats._state("x.com", create=True)
+        state["consecutive_failures"] = 5
+        state["quarantine_reason"] = "timeout"
+        # Use the timeout-specific base TTL (600s) plus a buffer instead of generic TTL
+        timeout_ttl = float(getattr(config, "ROUTE_QUARANTINE_TIMEOUT_BASE_SEC", 600.0))
+        state["quarantine_ts"] = route_manager.time.monotonic() - timeout_ttl - 1.0
+
+        self.assertFalse(stats.is_quarantined(route_manager.time.monotonic(), domain="x.com"))
+        self.assertEqual(state["quarantine_reason"], "")
+        self.assertEqual(state["consecutive_failures"], 0)
+
+    def test_google_only_endpoints_remain_candidates_for_non_google_targets(self):
+        google_ep = ("1.1.1.1", 443)
+        universal_ep = ("2.2.2.2", 443)
+        with patch.object(config, "IP_POOL", {
+            google_ep: "mail.google.com",
+            universal_ep: "x.com",
+        }), patch.object(
+            route_manager.STATE,
+            "ip_pool",
+            return_value={
+                google_ep: "mail.google.com",
+                universal_ep: "x.com",
+            },
+        ):
+            config.IP_POOL_METADATA[google_ep] = {
+                "domains": ("mail.google.com",),
+                "latency_ms": 450.0,
+                "google_verified": True,
+                "google_only": True,
+                "universal": False,
+            }
+            config.IP_POOL_METADATA[universal_ep] = {
+                "domains": ("x.com",),
+                "latency_ms": 4200.0,
+                "google_verified": False,
+                "google_only": False,
+                "universal": True,
+            }
+            route_manager._POOL_CACHE["expiry"] = 0.0
+            route_manager._POOL_CACHE["sig"] = None
+            route_manager._POOL_CACHE["eps"] = []
+            primary, fallback = route_manager._prepare_candidates(
+                443,
+                banned_for_domain=set(),
+                target_host="x.com",
+            )
+
+        self.assertIn(google_ep, primary)
+        self.assertNotIn(google_ep, fallback)
+        self.assertIn(universal_ep, primary)
+
+    def test_google_targets_prefer_google_verified_endpoints(self):
+        google_ep = ("4.4.4.4", 443)
+        universal_ep = ("5.5.5.5", 443)
+        with patch.object(config, "IP_POOL", {
+            google_ep: "mail.google.com",
+            universal_ep: "x.com",
+        }), patch.object(
+            route_manager.STATE,
+            "ip_pool",
+            return_value={
+                google_ep: "mail.google.com",
+                universal_ep: "x.com",
+            },
+        ):
+            config.IP_POOL_METADATA[google_ep] = {
+                "domains": ("mail.google.com",),
+                "latency_ms": 450.0,
+                "google_verified": True,
+                "google_only": True,
+                "universal": False,
+            }
+            config.IP_POOL_METADATA[universal_ep] = {
+                "domains": ("x.com",),
+                "latency_ms": 4200.0,
+                "google_verified": False,
+                "google_only": False,
+                "universal": True,
+            }
+            route_manager._POOL_CACHE["expiry"] = 0.0
+            route_manager._POOL_CACHE["sig"] = None
+            route_manager._POOL_CACHE["eps"] = []
+            primary, fallback = route_manager._prepare_candidates(
+                443,
+                banned_for_domain=set(),
+                target_host="mail.google.com",
+            )
+
+        self.assertIn(google_ep, primary)
+        self.assertLess(
+            route_manager._target_candidate_priority(google_ep, "mail.google.com"),
+            route_manager._target_candidate_priority(universal_ep, "mail.google.com"),
+        )
+
+    def test_known_latency_endpoint_gets_extended_probe_timeout(self):
+        endpoint = ("3.3.3.3", 443)
+        config.IP_POOL_METADATA[endpoint] = {
+            "domains": ("chatgpt.com",),
+            "latency_ms": 3118.0,
+            "google_verified": False,
+            "google_only": False,
+            "universal": True,
+        }
+
+        timeout_sec = route_manager._endpoint_probe_timeout_sec(endpoint, "chatgpt.com")
+
+        self.assertGreater(timeout_sec, 3.118)
+        self.assertGreater(timeout_sec, config.RACE_PER_IP_TIMEOUT)
+        self.assertAlmostEqual(timeout_sec, (3118.0 + config.ROUTE_KNOWN_LATENCY_HEADROOM_MS) / 1000.0, places=3)
+
+    def test_verify_sni_rejects_invalid_hostname_before_probe(self):
+        called = {"probe": 0}
+
+        async def fake_probe(*args, **kwargs):
+            called["probe"] += 1
+            return True
+
+        with patch.object(route_manager, "probe_route_endpoint", side_effect=fake_probe):
+            import asyncio
+
+            result = asyncio.run(
+                route_manager.verify_sni(
+                    "1.1.1.1",
+                    "bad-.example.com",
+                    port=443,
+                    timeout=0.5,
+                    http_verify=True,
+                    tls_only=False,
+                    return_reason=True,
+                )
+            )
+
+        self.assertEqual(result, (None, 0.0, "invalid-server-hostname"))
+        self.assertEqual(called["probe"], 0)
+
+    def test_mark_route_dead_purges_l2_and_quarantines_endpoint(self):
+        host = "example.com"
+        endpoint = ("1.1.1.1", 443)
+        route_manager.STATE.exact_routes()[host] = {443: endpoint[0]}
+        route_manager.STATE.wildcard_routes()[".example.com"] = {443: endpoint[0]}
+
+        route_manager.mark_route_dead(host, 443, endpoint, reason="connect-error", latency_ms=42.0)
+
+        self.assertNotIn(host, route_manager.STATE.exact_routes())
+        self.assertNotIn(".example.com", route_manager.STATE.wildcard_routes())
+        self.assertTrue(route_manager._get_endpoint_stats(endpoint).is_quarantined(domain=host))
+        self.assertFalse(route_manager._get_endpoint_stats(endpoint).is_quarantined(domain="other.com"))
 
     def test_tls_endpoint_ban_applies_across_tls_target_ports(self):
         host = "api.chatgpt.com"
@@ -345,6 +515,77 @@ class RouteManagerSmokeTests(unittest.TestCase):
         self.assertIn(("2.2.2.2", 443), eps_first)
         self.assertIn(("3.3.3.3", 443), eps_first)
         self.assertEqual(len(eps_first), 3)
+
+
+class MmdfSmokeTests(unittest.TestCase):
+    def test_profile_matching_routes_reddit_through_fastly_profile(self):
+        profile = mmdf_engine.match_fronting_profile("reddit.com")
+
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["name"], "fastly")
+        self.assertEqual(profile["front_sni"], "www.python.org")
+
+    def test_pick_outbound_ip_uses_profile_front_without_global_override(self):
+        async def fake_resolve_host(hostname, target_port):
+            self.assertEqual(hostname, "www.python.org")
+            self.assertEqual(target_port, 443)
+            return "151.101.0.223"
+
+        profile = mmdf_engine.match_fronting_profile("reddit.com")
+        with patch.object(mmdf_engine, "_resolve_host", side_effect=fake_resolve_host):
+            import asyncio
+
+            result = asyncio.run(
+                mmdf_engine.pick_outbound_ip(
+                    profile,
+                    443,
+                    prefer_front_ip=True,
+                    front_sni_override=None,
+                    front_ip_override=None,
+                )
+            )
+
+        self.assertEqual(result, ("151.101.0.223", 443))
+
+    def test_mmdf_disabled_prompt_does_not_ask_for_front_sni_or_ip(self):
+        prompts = []
+
+        def fake_input(prompt):
+            prompts.append(prompt)
+            return "n"
+
+        with patch("builtins.input", side_effect=fake_input):
+            white_core._resolve_mmdf_runtime()
+
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("Enable MMDF", prompts[0])
+        self.assertFalse(white_core._MMDF_READY)
+        self.assertEqual(config.MMDF_SNI, "")
+        self.assertEqual(config.MMDF_IP, "")
+
+    def test_mmdf_default_startup_uses_per_domain_profiles(self):
+        prompts = []
+
+        def fake_input(prompt):
+            prompts.append(prompt)
+            return ""
+
+        config.MMDF_SNI = "google.com"
+        config.MMDF_IP = "8.8.8.8"
+
+        with patch("builtins.input", side_effect=fake_input), patch.object(
+            white_core.mmdf_ca, "any_backend_available", return_value=True
+        ), patch.object(white_core.mmdf_ca, "ca_files_exist", return_value=True), patch.object(
+            white_core.mmdf_ca, "is_ca_installed", return_value=True
+        ):
+            white_core._resolve_mmdf_runtime()
+
+        self.assertTrue(white_core._MMDF_READY)
+        self.assertEqual(white_core._MMDF_FRONT_SNI, "")
+        self.assertEqual(white_core._MMDF_FRONT_IP, "")
+        self.assertEqual(config.MMDF_SNI, "")
+        self.assertEqual(config.MMDF_IP, "")
+        self.assertTrue(any("per-domain profiles" in prompt for prompt in prompts))
 
 
 class StorageSmokeTests(unittest.TestCase):

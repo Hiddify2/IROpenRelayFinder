@@ -15,91 +15,55 @@ def load_asn_data():
     """Loads ASN datasets into memory for fast IP lookups."""
     global ASN_LOADED
     if ASN_LOADED: return
-
+    
     v4_path = paths.root_path("IranASNs", "filtered_ipv4.csv")
     if os.path.exists(v4_path):
-        with open(v4_path, 'r', encoding='utf-8-sig') as f:
+        with open(v4_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
             next(reader, None) # Skip header
             for row in reader:
                 if len(row) >= 9:
                     try:
-                        net = ipaddress.IPv4Network(row[0].strip(), strict=False)
-                        first_octet = net.network_address.packed[0]
-                        ASN_DATA_V4[first_octet].append((net, row[5].strip(), row[6].strip(), row[8].strip()))
-                    except Exception:
+                        net = ipaddress.IPv4Network(row[0], strict=False)
+                        first_octet = int(net.network_address.exploded.split('.')[0])
+                        ASN_DATA_V4[first_octet].append((net, row[5], row[6], row[8]))
+                    except Exception: 
                         pass
-
+                        
     v6_path = paths.root_path("IranASNs", "filtered_ipv6.csv")
     if os.path.exists(v6_path):
-        with open(v6_path, 'r', encoding='utf-8-sig') as f:
+        with open(v6_path, 'r', encoding='utf-8') as f:
             reader = csv.reader(f)
             next(reader, None) # Skip header
             for row in reader:
                 if len(row) >= 9:
                     try:
-                        net = ipaddress.IPv6Network(row[0].strip(), strict=False)
-                        ASN_DATA_V6.append((net, row[5].strip(), row[6].strip(), row[8].strip()))
-                    except Exception:
+                        net = ipaddress.IPv6Network(row[0], strict=False)
+                        ASN_DATA_V6.append((net, row[5], row[6], row[8]))
+                    except Exception: 
                         pass
-
+                        
     ASN_LOADED = True
 
 def get_asn_info(ip_str):
     """Takes an IP string and returns a tuple: (asn, as_name, as_type)"""
-    if not ASN_LOADED:
+    if not ASN_LOADED: 
         load_asn_data()
     try:
-        ip_str = ip_str.strip()
         ip_obj = ipaddress.ip_address(ip_str)
         if ip_obj.version == 4:
-            # Use packed bytes for the first-octet bucket — avoids split/int parsing entirely
-            first_octet = ip_obj.packed[0]
+            # Optimize lookups by checking only the subnets mapped to the IP's first octet
+            first_octet = int(ip_str.split('.')[0])
             for net, asn, name, as_type in ASN_DATA_V4.get(first_octet, []):
-                if ip_obj in net:
+                if ip_obj in net: 
                     return asn, name, as_type
         else:
-            # Transparently resolve IPv4-mapped IPv6 addresses (e.g. ::ffff:2.144.5.6)
-            mapped = ip_obj.ipv4_mapped
-            if mapped is not None:
-                first_octet = mapped.packed[0]
-                for net, asn, name, as_type in ASN_DATA_V4.get(first_octet, []):
-                    if mapped in net:
-                        return asn, name, as_type
-            else:
-                for net, asn, name, as_type in ASN_DATA_V6:
-                    if ip_obj in net:
-                        return asn, name, as_type
+            for net, asn, name, as_type in ASN_DATA_V6:
+                if ip_obj in net: 
+                    return asn, name, as_type
     except Exception:
         pass
     return None, "Unknown ASN", "Unknown"
-
-
-def is_iranian_ip(ip_str):
-    """Returns True if the given IP belongs to an Iranian ASN."""
-    asn, _, _ = get_asn_info(ip_str)
-    return asn is not None
-
-
-def filter_to_iranian(items):
-    """
-    Filters a list of IP strings or (ip, port) tuples to only Iranian IPs.
-    Returns (filtered_items, dropped_count).
-    """
-    if not ASN_LOADED:
-        load_asn_data()
-    result = []
-    dropped = 0
-    for item in items:
-        if isinstance(item, tuple):
-            ip = str(item[0]).strip()
-        else:
-            ip = str(item).split(':')[0].strip()
-        if is_iranian_ip(ip):
-            result.append(item)
-        else:
-            dropped += 1
-    return result, dropped
 
 def search_asns_by_regex(pattern_str, silent=False):
     """

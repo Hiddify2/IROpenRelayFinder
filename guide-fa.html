@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>راهنمای کامل White Proxy (آفلاین)</title>
+  <title>راهنمای کامل IROpenRelayFinder (آفلاین)</title>
   <style>
     :root {
       --bg: #0b1020;
@@ -239,13 +239,13 @@
 
     <main class="content">
       <section id="intro">
-        <h1>راهنمای جامع White Proxy (نسخه آفلاین فارسی)</h1>
+        <h1>راهنمای جامع IROpenRelayFinder (نسخه آفلاین فارسی)</h1>
         <span class="badge">Linux-first</span>
         <span class="badge">Stdlib-only (بدون پکیج پایتون)</span>
         <span class="badge">Offline قابل مشاهده</span>
 
         <p>
-          این سند یک راهنمای کامل و فنی برای استفاده از پروژه <strong>White Proxy</strong> است: از اجرای اولیه،
+          این سند یک راهنمای کامل و فنی برای استفاده از پروژه <strong>IROpenRelayFinder</strong> است: از اجرای اولیه،
           ساخت IP Pool، اجرای مودهای مختلف، اتصال V2Ray/Xray روی <strong>127.0.0.1:7080</strong>،
           تا توضیح ریزپایپلاین‌ها و رفتارهای پنهان/پس‌زمینه.
         </p>
@@ -304,11 +304,11 @@
             <tr>
               <td>HTTP/SOCKS Proxy Chain</td>
               <td>V2Ray/Xray یا سیستم‌عامل را طوری تنظیم می‌کنید که درخواست‌ها به <code>127.0.0.1:7080</code> بروند.</td>
-              <td>وقتی می‌خواهید همه/بخشی از ترافیک از White Proxy عبور کند.</td>
+              <td>وقتی می‌خواهید همه/بخشی از ترافیک از IROpenRelayFinder عبور کند.</td>
             </tr>
             <tr>
               <td>Transparent TLS Path</td>
-              <td>White Proxy بایت اول TLS را تشخیص می‌دهد (مسیر Transparent TLS برای V2Ray/Xray).</td>
+              <td>IROpenRelayFinder بایت اول TLS را تشخیص می‌دهد (مسیر Transparent TLS برای V2Ray/Xray).</td>
               <td>برای سناریوهایی که ترافیک TLS به شکل شفاف به پروکسی می‌رسد.</td>
             </tr>
           </tbody>
@@ -316,7 +316,7 @@
 
         <h3>چک‌لیست سریع</h3>
         <ul>
-          <li>White Proxy را با <strong>[d]</strong> یا <strong>[m]</strong> بالا بیاور.</li>
+          <li>IROpenRelayFinder را با <strong>[d]</strong> یا <strong>[m]</strong> بالا بیاور.</li>
           <li>در کلاینت خود upstream را روی <code>127.0.0.1:7080</code> بگذار.</li>
           <li>اگر نیاز به DPI injection داری، از منوی <strong>[7]</strong> استراتژی را انتخاب کن.</li>
           <li>در Mixed، ترافیک 443 می‌تواند مسیر DPI بگیرد و بقیه/وب عمومی از White Pool استفاده کند.</li>

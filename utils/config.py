@@ -9,12 +9,13 @@ from utils import data_store
 # ==========================================
 # GENERAL CONFIGURATION
 # ==========================================
-VERSION = "8.2.0"
+VERSION = "9.2.1"
 PROXY_HOST = '0.0.0.0'
 PROXY_PORT = 7080
 
 DEFAULT_TARGET_PORTS = [443,2053,2083,2087,2096,8443]
-TARGET_PORTS = DEFAULT_TARGET_PORTS
+TARGET_PORTS = list(DEFAULT_TARGET_PORTS)
+LAST_TARGET_PORTS = list(DEFAULT_TARGET_PORTS)
 
 def _normalize_ports(ports):
     normalized = []
@@ -34,13 +35,15 @@ def _normalize_ports(ports):
 def primary_target_port():
     return TARGET_PORTS[0] if TARGET_PORTS else 443
 
-def set_target_ports(ports, persist=False):
+def set_target_ports(ports, persist=False, remember=False):
     """
     Normalizes and applies a new target port list.
     Optionally persists the change to config storage.
     """
-    global TARGET_PORTS
+    global TARGET_PORTS, LAST_TARGET_PORTS
     TARGET_PORTS = _normalize_ports(ports)
+    if remember:
+        LAST_TARGET_PORTS = list(TARGET_PORTS)
     if persist:
         save_config()
     return TARGET_PORTS
@@ -55,6 +58,11 @@ def is_tls_port(port):
 CONNECTION_MODE = "white_ip" 
 DPI_SNI = "speed.cloudflare.com"
 DPI_IP = ""
+
+# Optional global MMDF front override. Empty means use per-domain profiles from
+# MMDF_FRONTING_PROFILES.
+MMDF_SNI = ""
+MMDF_IP = ""
 
 # Evasion: SNI Pool to prevent statistical pattern detection
 DPI_SNI_POOL = [
@@ -81,6 +89,9 @@ DPI_FRAGMENTATION = True
 ALWAYS_SHOW_DPI_LOGS = False
 DPI_FAILURES = 0 # Tracks consecutive failures for auto-tuning
 
+# Router debug logging (prompted at proxy startup; default off)
+ROUTER_DEBUG = False
+
 # ==========================================
 # FILE PATHS (CANONICAL: data/, LEGACY-COMPATIBLE)
 # ==========================================
@@ -96,6 +107,7 @@ DESYNC_PAIRS_FILE = data_store.write_path("desync_pairs.json")
 # GLOBAL STATE POOLS & CACHES
 # ==========================================
 IP_POOL = {}  
+IP_POOL_METADATA = {}
 DEAD_IP_POOL = {} 
 FAILED_DOMAINS = set()
 BANNED_ROUTES = {}
@@ -126,11 +138,111 @@ BACKGROUND_SCAN_PAUSE_CONNECTIONS = 6
 # TARGET DOMAINS & LISTS
 # ==========================================
 DEFAULT_DOMAINS = [
-    "instagram.com","chatgpt.com","google.com",
-    "web.telegram.org", "github.com", "meet.turns.goog", "claude.ai",
-    "dash.cloudflare.com", "pages.dev", "workers.dev"]
+    "instagram.com","chatgpt.com", 
+    "web.telegram.org", "reddit.com", "claude.ai",
+    "pages.dev", "workers.dev"]
 
-VIDEO_CDN_DOMAINS = ('googlevideo.com', 'gvt1.com', 'ytimg.com', 'ggpht.com', 'turns.goog')
+# ==========================================
+# MMDF (Man-in-the-Middle + Domain Fronting)
+# ==========================================
+# Domains routed through the MMDF engine instead of the normal relay path.
+# Each profile groups domains that share an edge fleet (Google, Vercel,
+# Fastly, AWS CloudFront), so the outbound TLS can be terminated with the
+# *real* sibling hostname as SNI ("www.google.com" for Google services,
+# "react.dev" for Vercel, etc.). Random / fake SNIs don't work — Google's
+# edge will close the connection or refuse to serve the inner Host header.
+# Targets that *would* match a profile but don't allow domain fronting and
+# would 403 the inner Host header. Checked before any profile match.
+MMDF_DOMAIN_EXCLUDES = [
+    "gemini.google.com",
+    "bard.google.com",
+    "aistudio.google.com",
+    "ai.google.dev",
+    "notebooklm.google.com",
+    "shell.cloud.google.com",
+]
+
+MMDF_FRONTING_PROFILES = [
+    # Google video CDN: same front but force HTTP/1.1 — googlevideo backends
+    # don't speak h2 reliably under the front. Listed first so it wins the
+    # match before the broader Google profile.
+    {
+        "name": "google-video",
+        "domains": [
+            "googlevideo.com",
+            "gvt1.com",
+        ],
+        "front_sni": "www.google.com",
+        "front_ip_host": "www.google.com",
+        "force_alpn": ["http/1.1"],
+    },
+    # All other Google services share Google's edge IPs and accept
+    # www.google.com as SNI.
+    {
+        "name": "google",
+        "domains": [
+            "google.com",
+            "googleapis.com",
+            "googleusercontent.com",
+            "gstatic.com",
+            "youtube.com",
+            "youtu.be",
+            "youtube-nocookie.com",
+            "ytimg.com",
+            "ggpht.com",
+            "yt.be",
+            "meet.google.com",
+            "turns.goog",
+        ],
+        "front_sni": "www.google.com",
+        "front_ip_host": "www.google.com",
+        "force_alpn": None,
+    },
+    {
+        "name": "vercel",
+        "domains": [
+            "vercel.app",
+            "vercel.com",
+            "vercel.dev",
+            "vercel.live",
+            "vercel.sh",
+            "vercel-dns.com",
+            "now.sh",
+            "zeit.co",
+            "react.dev",
+            "nextjs.org",
+            "cursor.com",
+            "ai-sdk.dev",
+        ],
+        "front_sni": "react.dev",
+        "front_ip_host": "react.dev",
+        "force_alpn": None,
+    },
+    {
+        "name": "fastly",
+        "domains": [
+            "fastly.com",
+            "python.org",
+            "pypi.org",
+            "reddit.com",
+            "githubusercontent.com",
+            "githubassets.com",
+        ],
+        "front_sni": "www.python.org",
+        "front_ip_host": "www.python.org",
+        "force_alpn": None,
+    },
+    {
+        "name": "cloudfront",
+        "domains": [
+            "aws.amazon.com",
+            "letsencrypt.org",
+        ],
+        "front_sni": "kubernetes.io",
+        "front_ip_host": "kubernetes.io",
+        "force_alpn": None,
+    },
+]
 
 CLOUDFLARE_CNAME_DOMAINS = [
     "speed.marisalnc.com", "cloudflare.182682.xyz", "rapid-lake-4bce.zajrvcwp.workers.dev",
@@ -155,10 +267,14 @@ DESYNC_SNI_LIST = [
 # ==========================================
 # SCANNER & PROXY LIMITS
 # ==========================================
-SCAN_TIMEOUT = 6.0 
-HARD_SCAN_TIMEOUT = 45.0 
-RACE_TIMEOUT = 4.0
-VIDEO_RACE_TIMEOUT = 7.0 
+SCAN_TIMEOUT = 6.0
+HARD_SCAN_TIMEOUT = 45.0
+# Global race timeout for a full resolve() attempt. Must be high enough for
+# universal endpoints whose baseline RTT can exceed several seconds.
+RACE_TIMEOUT = 8.0
+# Hard cap for any single router-side network probe. The router wraps connect,
+# TLS, and HTTP verification work in this limit to prevent event-loop hangs.
+ROUTE_MAX_RACE_MS = int(RACE_TIMEOUT * 1000.0)
 PROBE_READ_TIMEOUT = 3.5
 SCAN_RETRY_ATTEMPTS = 2
 
@@ -169,6 +285,13 @@ RACE_BATCH_MIN = 2
 RACE_BATCH_LOAD_DOWNSTEP = 1
 RACE_NATIVE_HEADSTART_SEC = 0.3
 RACE_PER_IP_TIMEOUT = 2.5
+# After a hot-cache failure, keep the retry budget short so the caller gets
+# a fresh answer instead of waiting for a full cold-start race.
+ROUTE_FAST_FALLBACK_TIMEOUT_SEC = 2.25
+ROUTE_FAST_FALLBACK_PER_IP_TIMEOUT_SEC = 1.75
+# Known-latency endpoints need extra headroom so slow-but-valid universal IPs
+# do not get clipped by the strict unknown-endpoint timeout.
+ROUTE_KNOWN_LATENCY_HEADROOM_MS = 1500.0
 
 # Adaptive concurrency for the race semaphore. The router-level
 # AdaptiveThrottler watches gateway RTT and grows/shrinks the limit
@@ -187,12 +310,34 @@ ROUTE_SCORE_FAIL_WEIGHT = 250.0
 ROUTE_SCORE_RECENCY_WEIGHT = 3.0
 ROUTE_SCORE_RECENCY_CAP_SEC = 120.0
 ROUTE_EWMA_ALPHA = 0.35
+ROUTE_SCORE_NEUTRAL_LATENCY_MS = 700.0
+ROUTE_SCORE_FAIL_CAP = 8
+ROUTE_FAIL_WEIGHT_GENERIC = 3.0
+ROUTE_FAIL_WEIGHT_TIMEOUT = 8.0
+ROUTE_FAIL_WEIGHT_CONNECT_ERROR = 12.0
+ROUTE_FAIL_WEIGHT_TLS_ERROR = 5.0
+ROUTE_FAIL_WEIGHT_HTTP_REJECT = 4.0
+# How long an endpoint stays in quarantine before being re-admitted.
+ROUTE_QUARANTINE_TTL_SEC = 60.0
+ROUTE_QUARANTINE_SEVERE_BASE_SEC = 300.0
+ROUTE_QUARANTINE_CONNECT_BASE_SEC = 600.0
+ROUTE_QUARANTINE_TLS_BASE_SEC = 900.0
+ROUTE_QUARANTINE_TIMEOUT_BASE_SEC = 600.0
+ROUTE_QUARANTINE_BACKOFF_MAX_SEC = 86400.0
+ROUTE_QUARANTINE_BACKOFF_CAP = 8
+ROUTE_QUARANTINE_SEVERE_THRESHOLD = 1
+ROUTE_QUARANTINE_TIMEOUT_THRESHOLD = 3
+ROUTE_QUARANTINE_REPEAT_TIMEOUT_THRESHOLD = ROUTE_QUARANTINE_TIMEOUT_THRESHOLD
+ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD = 8
+ROUTE_QUARANTINE_TLS_THRESHOLD = 4
 
 # Use-time route hygiene (penalties applied by the proxy when a chosen
 # route fails or under-performs at connect / relay time).
-ROUTE_CONNECT_FAIL_WEIGHT = 6      # heavy enough to push past ROUTE_EVICT_FAIL_THRESHOLD
-ROUTE_NO_DATA_FAIL_WEIGHT = 4
-ROUTE_SLOW_FAIL_WEIGHT    = 2
+ROUTE_CONNECT_FAIL_WEIGHT = 6.0      # heavy enough to push past ROUTE_EVICT_FAIL_THRESHOLD
+ROUTE_NO_DATA_FAIL_WEIGHT = 4.0
+ROUTE_SLOW_FAIL_WEIGHT    = 2.0
+ROUTE_QUARANTINE_CONNECT_THRESHOLD = 4
+ROUTE_QUARANTINE_RECOVERY_BATCH = 4
 
 # Relay watchdog: a download that produces no bytes for this long is
 # treated as a slow/dead IP, the route is demoted, and the next request
@@ -215,7 +360,7 @@ PROXY_CONNECT_TIMEOUT = 6.0
 ROUTE_HTTP_VERIFY_RACE = True
 
 
-MAX_CONCURRENT_SCANS = 100 
+MAX_CONCURRENT_SCANS = 1000 
 CHUNK_SIZE = 50000
 
 TUNED_MASSCAN_RATE = None
@@ -228,6 +373,25 @@ TUNED_NMAP_MAX_RATE = None
 # Strict TLS Context to prevent generic Edge IPs from polluting the pool
 SSL_CONTEXT = ssl.create_default_context()
 PROBE_SSL_CONTEXT = ssl.create_default_context()
+try:
+    PROBE_SSL_CONTEXT.set_ciphers(
+        "ECDHE-ECDSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-AES256-GCM-SHA384:"
+        "ECDHE-ECDSA-AES128-GCM-SHA256:"
+        "ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-CHACHA20-POLY1305:"
+        "DHE-RSA-AES256-GCM-SHA384:"
+        "DHE-RSA-AES128-GCM-SHA256:"
+        "AES256-GCM-SHA384:"
+        "AES128-GCM-SHA256"
+    )
+    if hasattr(PROBE_SSL_CONTEXT, "set_ciphersuites"):
+        PROBE_SSL_CONTEXT.set_ciphersuites(
+            "TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_256_GCM_SHA384"
+        )
+except Exception:
+    pass
 try: 
     PROBE_SSL_CONTEXT.set_alpn_protocols(['http/1.1'])
 except Exception: 
@@ -238,14 +402,25 @@ except Exception:
 # ==========================================
 def load_config():
     global MAX_CONCURRENT_SCANS, TUNED_MASSCAN_RATE, TUNED_NMAP_MIN_RATE, TUNED_NMAP_MAX_RATE
-    global CONNECTION_MODE, DPI_SNI, DPI_IP, DPI_STRATEGIES, ACTIVE_DPI_STRATEGY, DPI_FRAGMENTATION
+    global CONNECTION_MODE, DPI_SNI, DPI_IP, MMDF_SNI, MMDF_IP
+    global DPI_STRATEGIES, ACTIVE_DPI_STRATEGY, DPI_FRAGMENTATION
     global VALIDATED_SNI_POOL, ALWAYS_ROUTE_PATTERNS, DO_NOT_ROUTE_PATTERNS
-    global TARGET_PORTS, PROBE_READ_TIMEOUT, SCAN_RETRY_ATTEMPTS
+    global TARGET_PORTS, LAST_TARGET_PORTS, PROBE_READ_TIMEOUT, SCAN_RETRY_ATTEMPTS
     global RACE_BATCH_PRIMARY, RACE_BATCH_FALLBACK, RACE_BATCH_MIN, RACE_BATCH_LOAD_DOWNSTEP
-    global RACE_NATIVE_HEADSTART_SEC, RACE_PER_IP_TIMEOUT
+    global RACE_NATIVE_HEADSTART_SEC, RACE_PER_IP_TIMEOUT, ROUTE_KNOWN_LATENCY_HEADROOM_MS
+    global ROUTE_MAX_RACE_MS
     global ROUTE_L1_TTL_SEC, ROUTE_L1_NATIVE_TTL_SEC, ROUTE_EVICT_FAIL_THRESHOLD
     global ROUTE_SCORE_LATENCY_WEIGHT, ROUTE_SCORE_FAIL_WEIGHT, ROUTE_SCORE_RECENCY_WEIGHT
     global ROUTE_SCORE_RECENCY_CAP_SEC, ROUTE_EWMA_ALPHA
+    global ROUTE_SCORE_NEUTRAL_LATENCY_MS, ROUTE_SCORE_FAIL_CAP
+    global ROUTE_FAIL_WEIGHT_GENERIC, ROUTE_FAIL_WEIGHT_TIMEOUT
+    global ROUTE_FAIL_WEIGHT_CONNECT_ERROR, ROUTE_FAIL_WEIGHT_TLS_ERROR
+    global ROUTE_FAIL_WEIGHT_HTTP_REJECT
+    global ROUTE_CONNECT_FAIL_WEIGHT, ROUTE_NO_DATA_FAIL_WEIGHT, ROUTE_SLOW_FAIL_WEIGHT
+    global ROUTE_QUARANTINE_CONNECT_THRESHOLD, ROUTE_QUARANTINE_RECOVERY_BATCH
+    global ROUTE_QUARANTINE_TTL_SEC, ROUTE_QUARANTINE_TIMEOUT_THRESHOLD, ROUTE_QUARANTINE_REPEAT_TIMEOUT_THRESHOLD
+    global ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD, ROUTE_QUARANTINE_TLS_THRESHOLD
+    global MMDF_FRONTING_PROFILES
     
     if os.path.exists(CONFIG_FILE):
         try:
@@ -258,10 +433,15 @@ def load_config():
                 CONNECTION_MODE = config.get("CONNECTION_MODE", CONNECTION_MODE)
                 DPI_SNI = config.get("DPI_SNI", DPI_SNI)
                 DPI_IP = config.get("DPI_IP", DPI_IP)
+                MMDF_SNI = str(config.get("MMDF_SNI", MMDF_SNI) or "").strip()
+                MMDF_IP = str(config.get("MMDF_IP", MMDF_IP) or "").strip()
                 DPI_STRATEGIES = config.get("DPI_STRATEGIES", DPI_STRATEGIES)
                 DPI_FRAGMENTATION = config.get("DPI_FRAGMENTATION", DPI_FRAGMENTATION)
                 ALWAYS_ROUTE_PATTERNS = config.get("ALWAYS_ROUTE_PATTERNS", ALWAYS_ROUTE_PATTERNS)
                 DO_NOT_ROUTE_PATTERNS = config.get("DO_NOT_ROUTE_PATTERNS", DO_NOT_ROUTE_PATTERNS)
+                LAST_TARGET_PORTS = _normalize_ports(
+                    config.get("LAST_TARGET_PORTS", config.get("TARGET_PORTS", LAST_TARGET_PORTS))
+                )
                 TARGET_PORTS = _normalize_ports(config.get("TARGET_PORTS", TARGET_PORTS))
                 RACE_BATCH_PRIMARY = int(config.get("RACE_BATCH_PRIMARY", RACE_BATCH_PRIMARY))
                 RACE_BATCH_FALLBACK = int(config.get("RACE_BATCH_FALLBACK", RACE_BATCH_FALLBACK))
@@ -269,6 +449,10 @@ def load_config():
                 RACE_BATCH_LOAD_DOWNSTEP = int(config.get("RACE_BATCH_LOAD_DOWNSTEP", RACE_BATCH_LOAD_DOWNSTEP))
                 RACE_NATIVE_HEADSTART_SEC = float(config.get("RACE_NATIVE_HEADSTART_SEC", RACE_NATIVE_HEADSTART_SEC))
                 RACE_PER_IP_TIMEOUT = float(config.get("RACE_PER_IP_TIMEOUT", RACE_PER_IP_TIMEOUT))
+                ROUTE_MAX_RACE_MS = int(config.get("ROUTE_MAX_RACE_MS", ROUTE_MAX_RACE_MS))
+                ROUTE_KNOWN_LATENCY_HEADROOM_MS = float(
+                    config.get("ROUTE_KNOWN_LATENCY_HEADROOM_MS", ROUTE_KNOWN_LATENCY_HEADROOM_MS)
+                )
                 PROBE_READ_TIMEOUT = float(config.get("PROBE_READ_TIMEOUT", PROBE_READ_TIMEOUT))
                 SCAN_RETRY_ATTEMPTS = int(config.get("SCAN_RETRY_ATTEMPTS", SCAN_RETRY_ATTEMPTS))
 
@@ -281,6 +465,35 @@ def load_config():
                 ROUTE_SCORE_RECENCY_WEIGHT = float(config.get("ROUTE_SCORE_RECENCY_WEIGHT", ROUTE_SCORE_RECENCY_WEIGHT))
                 ROUTE_SCORE_RECENCY_CAP_SEC = float(config.get("ROUTE_SCORE_RECENCY_CAP_SEC", ROUTE_SCORE_RECENCY_CAP_SEC))
                 ROUTE_EWMA_ALPHA = float(config.get("ROUTE_EWMA_ALPHA", ROUTE_EWMA_ALPHA))
+                ROUTE_SCORE_NEUTRAL_LATENCY_MS = float(config.get("ROUTE_SCORE_NEUTRAL_LATENCY_MS", ROUTE_SCORE_NEUTRAL_LATENCY_MS))
+                ROUTE_SCORE_FAIL_CAP = int(config.get("ROUTE_SCORE_FAIL_CAP", ROUTE_SCORE_FAIL_CAP))
+                ROUTE_FAIL_WEIGHT_GENERIC = float(config.get("ROUTE_FAIL_WEIGHT_GENERIC", ROUTE_FAIL_WEIGHT_GENERIC))
+                ROUTE_FAIL_WEIGHT_TIMEOUT = float(config.get("ROUTE_FAIL_WEIGHT_TIMEOUT", ROUTE_FAIL_WEIGHT_TIMEOUT))
+                ROUTE_FAIL_WEIGHT_CONNECT_ERROR = float(config.get("ROUTE_FAIL_WEIGHT_CONNECT_ERROR", ROUTE_FAIL_WEIGHT_CONNECT_ERROR))
+                ROUTE_FAIL_WEIGHT_TLS_ERROR = float(config.get("ROUTE_FAIL_WEIGHT_TLS_ERROR", ROUTE_FAIL_WEIGHT_TLS_ERROR))
+                ROUTE_FAIL_WEIGHT_HTTP_REJECT = float(config.get("ROUTE_FAIL_WEIGHT_HTTP_REJECT", ROUTE_FAIL_WEIGHT_HTTP_REJECT))
+                ROUTE_CONNECT_FAIL_WEIGHT = float(config.get("ROUTE_CONNECT_FAIL_WEIGHT", ROUTE_CONNECT_FAIL_WEIGHT))
+                ROUTE_NO_DATA_FAIL_WEIGHT = float(config.get("ROUTE_NO_DATA_FAIL_WEIGHT", ROUTE_NO_DATA_FAIL_WEIGHT))
+                ROUTE_SLOW_FAIL_WEIGHT = float(config.get("ROUTE_SLOW_FAIL_WEIGHT", ROUTE_SLOW_FAIL_WEIGHT))
+                ROUTE_QUARANTINE_CONNECT_THRESHOLD = int(
+                    config.get("ROUTE_QUARANTINE_CONNECT_THRESHOLD", ROUTE_QUARANTINE_CONNECT_THRESHOLD)
+                )
+                ROUTE_QUARANTINE_RECOVERY_BATCH = int(
+                    config.get("ROUTE_QUARANTINE_RECOVERY_BATCH", ROUTE_QUARANTINE_RECOVERY_BATCH)
+                )
+                ROUTE_QUARANTINE_TTL_SEC = float(config.get("ROUTE_QUARANTINE_TTL_SEC", ROUTE_QUARANTINE_TTL_SEC))
+                ROUTE_QUARANTINE_TIMEOUT_THRESHOLD = int(
+                    config.get(
+                        "ROUTE_QUARANTINE_TIMEOUT_THRESHOLD",
+                        config.get(
+                            "ROUTE_QUARANTINE_REPEAT_TIMEOUT_THRESHOLD",
+                            ROUTE_QUARANTINE_TIMEOUT_THRESHOLD,
+                        ),
+                    )
+                )
+                ROUTE_QUARANTINE_REPEAT_TIMEOUT_THRESHOLD = ROUTE_QUARANTINE_TIMEOUT_THRESHOLD
+                ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD = int(config.get("ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD", ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD))
+                ROUTE_QUARANTINE_TLS_THRESHOLD = int(config.get("ROUTE_QUARANTINE_TLS_THRESHOLD", ROUTE_QUARANTINE_TLS_THRESHOLD))
 
                 RACE_BATCH_PRIMARY = max(1, RACE_BATCH_PRIMARY)
                 RACE_BATCH_FALLBACK = max(1, RACE_BATCH_FALLBACK)
@@ -288,6 +501,8 @@ def load_config():
                 RACE_BATCH_LOAD_DOWNSTEP = max(0, RACE_BATCH_LOAD_DOWNSTEP)
                 RACE_NATIVE_HEADSTART_SEC = max(0.0, RACE_NATIVE_HEADSTART_SEC)
                 RACE_PER_IP_TIMEOUT = max(0.2, RACE_PER_IP_TIMEOUT)
+                ROUTE_MAX_RACE_MS = max(100, ROUTE_MAX_RACE_MS)
+                ROUTE_KNOWN_LATENCY_HEADROOM_MS = max(0.0, ROUTE_KNOWN_LATENCY_HEADROOM_MS)
                 PROBE_READ_TIMEOUT = max(2.0, min(8.0, PROBE_READ_TIMEOUT))
                 SCAN_RETRY_ATTEMPTS = max(1, min(4, SCAN_RETRY_ATTEMPTS))
 
@@ -296,6 +511,23 @@ def load_config():
                 ROUTE_EVICT_FAIL_THRESHOLD = max(1, ROUTE_EVICT_FAIL_THRESHOLD)
                 ROUTE_EWMA_ALPHA = min(0.95, max(0.01, ROUTE_EWMA_ALPHA))
                 ROUTE_SCORE_RECENCY_CAP_SEC = max(1.0, ROUTE_SCORE_RECENCY_CAP_SEC)
+                ROUTE_SCORE_NEUTRAL_LATENCY_MS = max(1.0, ROUTE_SCORE_NEUTRAL_LATENCY_MS)
+                ROUTE_SCORE_FAIL_CAP = max(0, ROUTE_SCORE_FAIL_CAP)
+                ROUTE_FAIL_WEIGHT_GENERIC = max(0.0, ROUTE_FAIL_WEIGHT_GENERIC)
+                ROUTE_FAIL_WEIGHT_TIMEOUT = max(0.0, ROUTE_FAIL_WEIGHT_TIMEOUT)
+                ROUTE_FAIL_WEIGHT_CONNECT_ERROR = max(0.0, ROUTE_FAIL_WEIGHT_CONNECT_ERROR)
+                ROUTE_FAIL_WEIGHT_TLS_ERROR = max(0.0, ROUTE_FAIL_WEIGHT_TLS_ERROR)
+                ROUTE_FAIL_WEIGHT_HTTP_REJECT = max(0.0, ROUTE_FAIL_WEIGHT_HTTP_REJECT)
+                ROUTE_CONNECT_FAIL_WEIGHT = max(0.0, ROUTE_CONNECT_FAIL_WEIGHT)
+                ROUTE_NO_DATA_FAIL_WEIGHT = max(0.0, ROUTE_NO_DATA_FAIL_WEIGHT)
+                ROUTE_SLOW_FAIL_WEIGHT = max(0.0, ROUTE_SLOW_FAIL_WEIGHT)
+                ROUTE_QUARANTINE_CONNECT_THRESHOLD = max(1, ROUTE_QUARANTINE_CONNECT_THRESHOLD)
+                ROUTE_QUARANTINE_RECOVERY_BATCH = max(1, ROUTE_QUARANTINE_RECOVERY_BATCH)
+                ROUTE_QUARANTINE_TTL_SEC = max(1.0, ROUTE_QUARANTINE_TTL_SEC)
+                ROUTE_QUARANTINE_TIMEOUT_THRESHOLD = max(1, ROUTE_QUARANTINE_TIMEOUT_THRESHOLD)
+                ROUTE_QUARANTINE_REPEAT_TIMEOUT_THRESHOLD = ROUTE_QUARANTINE_TIMEOUT_THRESHOLD
+                ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD = max(1, ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD)
+                ROUTE_QUARANTINE_TLS_THRESHOLD = max(1, ROUTE_QUARANTINE_TLS_THRESHOLD)
 
                 if not isinstance(ALWAYS_ROUTE_PATTERNS, list):
                     ALWAYS_ROUTE_PATTERNS = []
@@ -336,6 +568,10 @@ def load_config():
                 
                 if CONNECTION_MODE not in ["white_ip", "dpi_desync", "mixed"]:
                     CONNECTION_MODE = "white_ip"
+
+                stored_profiles = config.get("MMDF_FRONTING_PROFILES")
+                if isinstance(stored_profiles, list) and stored_profiles:
+                    MMDF_FRONTING_PROFILES = stored_profiles
                 
                 valid_strats = ["oob", "bad_csum", "ttl", "syn", "rst", "fin", "classic"]
                 if not isinstance(DPI_STRATEGIES, list) or not all(s in valid_strats for s in DPI_STRATEGIES):
@@ -374,17 +610,22 @@ def save_config():
         "CONNECTION_MODE": CONNECTION_MODE,
         "DPI_SNI": DPI_SNI,
         "DPI_IP": DPI_IP,
+        "MMDF_SNI": MMDF_SNI,
+        "MMDF_IP": MMDF_IP,
         "DPI_STRATEGIES": DPI_STRATEGIES,
         "DPI_FRAGMENTATION": DPI_FRAGMENTATION,
         "ALWAYS_ROUTE_PATTERNS": ALWAYS_ROUTE_PATTERNS,
         "DO_NOT_ROUTE_PATTERNS": DO_NOT_ROUTE_PATTERNS,
         "TARGET_PORTS": TARGET_PORTS,
+        "LAST_TARGET_PORTS": LAST_TARGET_PORTS,
         "RACE_BATCH_PRIMARY": RACE_BATCH_PRIMARY,
         "RACE_BATCH_FALLBACK": RACE_BATCH_FALLBACK,
         "RACE_BATCH_MIN": RACE_BATCH_MIN,
         "RACE_BATCH_LOAD_DOWNSTEP": RACE_BATCH_LOAD_DOWNSTEP,
         "RACE_NATIVE_HEADSTART_SEC": RACE_NATIVE_HEADSTART_SEC,
         "RACE_PER_IP_TIMEOUT": RACE_PER_IP_TIMEOUT,
+        "ROUTE_MAX_RACE_MS": ROUTE_MAX_RACE_MS,
+        "ROUTE_KNOWN_LATENCY_HEADROOM_MS": ROUTE_KNOWN_LATENCY_HEADROOM_MS,
         "PROBE_READ_TIMEOUT": PROBE_READ_TIMEOUT,
         "SCAN_RETRY_ATTEMPTS": SCAN_RETRY_ATTEMPTS,
         "ROUTE_L1_TTL_SEC": ROUTE_L1_TTL_SEC,
@@ -395,6 +636,24 @@ def save_config():
         "ROUTE_SCORE_RECENCY_WEIGHT": ROUTE_SCORE_RECENCY_WEIGHT,
         "ROUTE_SCORE_RECENCY_CAP_SEC": ROUTE_SCORE_RECENCY_CAP_SEC,
         "ROUTE_EWMA_ALPHA": ROUTE_EWMA_ALPHA,
+        "ROUTE_SCORE_NEUTRAL_LATENCY_MS": ROUTE_SCORE_NEUTRAL_LATENCY_MS,
+        "ROUTE_SCORE_FAIL_CAP": ROUTE_SCORE_FAIL_CAP,
+        "ROUTE_FAIL_WEIGHT_GENERIC": ROUTE_FAIL_WEIGHT_GENERIC,
+        "ROUTE_FAIL_WEIGHT_TIMEOUT": ROUTE_FAIL_WEIGHT_TIMEOUT,
+        "ROUTE_FAIL_WEIGHT_CONNECT_ERROR": ROUTE_FAIL_WEIGHT_CONNECT_ERROR,
+        "ROUTE_FAIL_WEIGHT_TLS_ERROR": ROUTE_FAIL_WEIGHT_TLS_ERROR,
+        "ROUTE_FAIL_WEIGHT_HTTP_REJECT": ROUTE_FAIL_WEIGHT_HTTP_REJECT,
+        "ROUTE_CONNECT_FAIL_WEIGHT": ROUTE_CONNECT_FAIL_WEIGHT,
+        "ROUTE_NO_DATA_FAIL_WEIGHT": ROUTE_NO_DATA_FAIL_WEIGHT,
+        "ROUTE_SLOW_FAIL_WEIGHT": ROUTE_SLOW_FAIL_WEIGHT,
+        "ROUTE_QUARANTINE_TTL_SEC": ROUTE_QUARANTINE_TTL_SEC,
+        "ROUTE_QUARANTINE_CONNECT_THRESHOLD": ROUTE_QUARANTINE_CONNECT_THRESHOLD,
+        "ROUTE_QUARANTINE_RECOVERY_BATCH": ROUTE_QUARANTINE_RECOVERY_BATCH,
+        "ROUTE_QUARANTINE_TIMEOUT_THRESHOLD": ROUTE_QUARANTINE_TIMEOUT_THRESHOLD,
+        "ROUTE_QUARANTINE_REPEAT_TIMEOUT_THRESHOLD": ROUTE_QUARANTINE_REPEAT_TIMEOUT_THRESHOLD,
+        "ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD": ROUTE_QUARANTINE_REPEAT_FAIL_THRESHOLD,
+        "ROUTE_QUARANTINE_TLS_THRESHOLD": ROUTE_QUARANTINE_TLS_THRESHOLD,
+        "MMDF_FRONTING_PROFILES": MMDF_FRONTING_PROFILES,
     }
     try:
         storage.atomic_write_json(CONFIG_FILE, config, indent=4)

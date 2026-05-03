@@ -46,13 +46,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "nuitka[onefile]"
+          python -m pip install cryptography
 
           # Optional, if the project adds dependencies later:
           # python -m pip install -r requirements.txt
-
-      - name: Install Windows curses
-        if: runner.os == 'Windows'
-        run: python -m pip install windows-curses
 
       - name: Validate Python sources
         run: python -m compileall -q main.py cores utils scripts
@@ -116,6 +113,7 @@ jobs:
             --include-module=sitecustomize \
             --include-package=cores \
             --include-package=utils \
+            --include-package=cryptography \
             --include-data-dir=assets=assets \
             --include-data-dir=IranASNs=IranASNs \
             main.py
@@ -133,6 +131,7 @@ jobs:
             --include-module=sitecustomize \
             --include-package=cores \
             --include-package=utils \
+            --include-package=cryptography \
             --include-data-dir=assets=assets \
             --include-data-dir=IranASNs=IranASNs \
             main.py
@@ -204,3 +203,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+

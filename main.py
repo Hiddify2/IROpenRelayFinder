@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-IROpenRelayFinder - UNIVERSAL LAUNCHER
+IROPENRELAYFINDER & SCANNER SUITE - UNIVERSAL LAUNCHER
 This file is designed to be completely agnostic to the underlying core logic.
-It sets up the OS environment, applies low-level async optimizations, and
+It sets up the OS environment, applies low-level async optimizations, and 
 dynamically imports and executes external core modules.
 """
 
@@ -115,7 +115,7 @@ def launch_core(core_name, forward_args):
 if __name__ == "__main__":
     # Setup a flexible CLI parser that ignores arguments it doesn't recognize
     parser = argparse.ArgumentParser(
-        description="IROpenRelayFinder - Modular Execution Engine",
+        description="IROpenRelayFinder & Scanner Suite - Modular Execution Engine",
         add_help=False # Disable default help so we can forward `-h` to the core
     )
     

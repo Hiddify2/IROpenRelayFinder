@@ -4,10 +4,10 @@ import sys
 from datetime import datetime
 
 
-APP_DIR_NAME = "iropen-relay-finder"
-ENV_HOME = "IRORF_HOME"
-ENV_DATA_DIR = "IRORF_DATA_DIR"
-ENV_ARCHIVE_DIR = "IRORF_ARCHIVE_DIR"
+APP_DIR_NAME = "white-proxy"
+ENV_HOME = "IR_OPEN_RELAY_FINDER_HOME"
+ENV_DATA_DIR = "IR_OPEN_RELAY_FINDER_DATA_DIR"
+ENV_ARCHIVE_DIR = "IR_OPEN_RELAY_FINDER_ARCHIVE_DIR"
 
 
 def _is_packaged():

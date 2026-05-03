@@ -4,18 +4,24 @@ import importlib
 import os
 
 from utils import paths
+from utils import mmdf_ca
 from utils import storage
 
 
 CORE_MODULES = [
     "adaptive_throttle",
     "autotuner",
+    "desync_core",
+    "desync_scanner",
     "http_scanner",
+    "mmdf_engine",
     "scanner",
     "smoke",
+    "sni_scanner",
     "socks5_scanner",
     "ui",
     "ui_asn",
+    "ui_dpi",
     "ui_layout",
     "ui_scan",
     "ui_tools",
@@ -28,6 +34,7 @@ UTIL_MODULES = [
     "config",
     "data_store",
     "helpers",
+    "mmdf_ca",
     "paths",
     "route_manager",
     "route_service",
@@ -73,11 +80,24 @@ def _check_writable_runtime_dirs():
             pass
 
 
+def _check_mmdf_backend():
+    if not mmdf_ca.any_backend_available():
+        summary = mmdf_ca.status_summary()
+        raise RuntimeError(
+            "MMDF certificate backend unavailable: "
+            f"backend={summary.get('backend')!r}, "
+            f"cryptography={summary.get('cryptography')!r}, "
+            f"cryptography_error={summary.get('cryptography_error')!r}, "
+            f"openssl={summary.get('openssl')!r}"
+        )
+
+
 def main():
     _check_imports("utils", UTIL_MODULES)
     _check_imports("cores", CORE_MODULES)
     _check_data_files()
     _check_writable_runtime_dirs()
+    _check_mmdf_backend()
     print("[+] Package self-check passed.")
 
 

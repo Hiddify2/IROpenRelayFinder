@@ -16,7 +16,6 @@ from cores.ui_layout import (
     color_text, print_section, print_hint, print_ok, print_warn, print_err,
     draw_header,
 )
-import cores.ui_prompts as ui_prompts
 
 DEFAULT_SOCKS5_PORTS = [1080, 1081, 1082, 1083, 1085, 3128, 8080, 8118, 9050, 9051, 10808]
 EXTENDED_SOCKS5_PORTS = [
@@ -272,18 +271,14 @@ async def run():
     print()
 
     # ── 1. Target Source ─────────────────────────────────────────────────────
-    src = ui_prompts.menu_choice(
-        "SCAN SOURCE",
-        [
-            ("1", "Load IPs/CIDRs/ASNs from text file", None),
-            ("2", "Paste IPs/CIDRs/ASNs manually", None),
-            ("3", "Use Permanent SOCKS5 cache", None),
-            ("4", "Select from IranASN database", None),
-            ("0", "Back", None),
-        ],
-        default="1",
-        remember_key="socks5_scan.source",
-    )
+    print_section("SCAN SOURCE")
+    print(" [1] Load IPs/CIDRs/ASNs from text file")
+    print(" [2] Paste IPs/CIDRs/ASNs manually")
+    print(" [3] Use Permanent Socks5 cache")
+    print(" [4] Mine IPs from Cloudflare CNAMEs")
+    print(" [5] Select from IranASN database")
+    print(" [0] Back")
+    src = input("\nChoice: ").strip()
 
     raw_lines = []
 
@@ -291,28 +286,61 @@ async def run():
         fp = input("File path: ").strip()
         if not os.path.exists(fp):
             print_err("File not found.")
-            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+            input("Press Enter to return...")
             return
         with open(fp, "r") as f:
             raw_lines = [l.strip() for l in f if l.strip()]
 
     elif src == "2":
-        raw_lines = ui_prompts.read_multiline("Paste targets (empty line to finish):")
+        print("Paste targets (empty line to finish):")
+        while True:
+            line = input().strip()
+            if not line:
+                break
+            raw_lines.append(line)
 
     elif src == "3":
         cached = helpers.load_socks5_cache()
         if not cached:
             print_err("SOCKS5 cache is empty.")
-            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+            input("Press Enter to return...")
             return
         raw_lines = list(dict.fromkeys(ip for ip, _ in cached))
         print_hint(f"Loaded {len(raw_lines)} IPs from SOCKS5 cache.")
 
     elif src == "4":
+        rounds_s = input("[?] DNS resolution rounds [Default 5]: ").strip()
+        rounds = int(rounds_s) if rounds_s.isdigit() else 5
+        delay_s = input("[?] Delay between rounds in seconds [Default 2]: ").strip()
+        delay = int(delay_s) if delay_s.isdigit() else 2
+
+        mined = set()
+        domains = list(config.CLOUDFLARE_CNAME_DOMAINS)
+        print_hint(f"Mining {len(domains)} Cloudflare domains over {rounds} rounds...")
+        for r in range(rounds):
+            sys.stdout.write(f"\r[*] Round {r+1}/{rounds} — IPs so far: {len(mined)}     ")
+            sys.stdout.flush()
+            random.shuffle(domains)
+            for domain in domains:
+                try:
+                    _, _, ip_list = socket.gethostbyname_ex(domain)
+                    mined.update(ip_list)
+                except Exception:
+                    pass
+            if r < rounds - 1:
+                time.sleep(delay)
+        print(f"\r{color_text('[*] Mining complete!', 'dim')} Discovered {len(mined)} IPs.            \n")
+        if not mined:
+            print_err("No IPs discovered.")
+            input("Press Enter to return...")
+            return
+        raw_lines = list(mined)
+
+    elif src == "5":
         import cores.ui_asn as ui_asn
         subnets = ui_asn.menu_search_asn()
         if not subnets:
-            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+            input("Press Enter to return...")
             return
         raw_lines = list(subnets)
 
@@ -323,33 +351,19 @@ async def run():
     ips = _expand_targets(raw_lines)
     if not ips:
         print_err("No valid IPs resolved.")
-        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+        input("Press Enter to return...")
         return
-
-    ips, dropped = asn_engine.filter_to_iranian(ips)
-    if dropped:
-        print_warn(f"{dropped} non-Iranian IP(s) were dropped (not found in IranASN database).")
-    if not ips:
-        print_err("No Iranian IPs remain after filtering.")
-        ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
-        return
-    print_ok(f"{len(ips)} Iranian IP(s) queued.")
+    print_ok(f"{len(ips)} unique IP(s) queued.")
 
     # ── 2. Ports ─────────────────────────────────────────────────────────────
-    draw_header()
+    print()
+    print_section("TARGET PORTS")
     default_str = ", ".join(str(p) for p in DEFAULT_SOCKS5_PORTS)
     extended_str = ", ".join(str(p) for p in EXTENDED_SOCKS5_PORTS)
-    port_key = ui_prompts.menu_choice(
-        "TARGET PORTS",
-        [
-            ("1", "Default SOCKS5 ports", default_str),
-            ("2", "Extended ports", extended_str[:50] + "..."),
-            ("3", "Custom ports", None),
-        ],
-        default="1",
-        prompt="Port mode",
-        remember_key="socks5_scan.port_mode",
-    )
+    print(f" [1] Default SOCKS5 ports  ({default_str})")
+    print(f" [2] Extended ports        ({extended_str[:50]}...)")
+    print(" [3] Custom ports")
+    port_key = input("\nChoice [Default 1]: ").strip()
 
     if port_key == "2":
         socks5_ports = list(EXTENDED_SOCKS5_PORTS)
@@ -363,47 +377,38 @@ async def run():
         socks5_ports = list(DEFAULT_SOCKS5_PORTS)
 
     # ── 3. Scan Method ────────────────────────────────────────────────────────
-    draw_header()
+    print()
+    print_section("SCAN METHOD")
     has_masscan = shutil.which("masscan") is not None
     has_nmap    = shutil.which("nmap")    is not None
 
-    total_eps = len(ips) * len(socks5_ports)
-    rate_disp = config.TUNED_MASSCAN_RATE or 5000
     method_map = {"1": "asyncio"}
-    method_options = [("1", "Asyncio direct", f"{total_eps} probes ({len(ips)} IPs x {len(socks5_ports)} ports), no extra tools")]
     opt = 2
     if has_masscan:
         method_map[str(opt)] = "masscan"
-        method_options.append((str(opt), "Masscan preflight", f"{rate_disp} pps, asyncio recovery sweep, then SOCKS5 verify"))
         opt += 1
     if has_nmap:
         method_map[str(opt)] = "nmap"
-        method_options.append((str(opt), "Nmap preflight", "Reliable port scan, asyncio recovery sweep, then SOCKS5 verify"))
 
-    method_key = ui_prompts.menu_choice(
-        "SCAN METHOD",
-        method_options,
-        default="1",
-        prompt="Method",
-    )
-    method = method_map.get(method_key, "asyncio")
-    ui_prompts.set_pref("socks5_scan.method", method)
+    total_eps = len(ips) * len(socks5_ports)
+    rate_disp = config.TUNED_MASSCAN_RATE or 5000
+    print(f" [1] Asyncio direct    — {total_eps} probes ({len(ips)} IPs × {len(socks5_ports)} ports), no extra tools")
+    if has_masscan:
+        k = next(k for k, v in method_map.items() if v == "masscan")
+        print(f" [{k}] Masscan preflight  — {rate_disp} pps, asyncio recovery sweep, then SOCKS5 verify")
+    if has_nmap:
+        k = next(k for k, v in method_map.items() if v == "nmap")
+        print(f" [{k}] Nmap preflight     — reliable port scan, asyncio recovery sweep, then SOCKS5 verify")
+
+    method = method_map.get(input("\nChoice [Default 1]: ").strip(), "asyncio")
 
     # ── 4. Tuning ─────────────────────────────────────────────────────────────
     print()
-    timeout = ui_prompts.prompt_float(
-        "[?] Connection timeout in seconds",
-        3.0,
-        min_value=0.2,
-        remember_key="socks5_scan.timeout",
-    )
+    t_raw = input("[?] Connection timeout in seconds [Default 5]: ").strip()
+    timeout = float(t_raw) if t_raw.replace('.', '', 1).isdigit() else 5.0
 
-    concurrency = ui_prompts.prompt_int(
-        "[?] Concurrency (parallel connections)",
-        500,
-        min_value=1,
-        remember_key="socks5_scan.concurrency",
-    )
+    c_raw = input("[?] Concurrency (parallel connections)  [Default 500]: ").strip()
+    concurrency = int(c_raw) if c_raw.isdigit() else 500
 
     # ── 6. Run ────────────────────────────────────────────────────────────────
     helpers.clear_screen()
@@ -417,7 +422,7 @@ async def run():
         candidates = await _gather_candidates(method, ips, socks5_ports)
         if not candidates:
             print_warn("No candidate endpoints to verify.")
-            ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
+            input("\nPress Enter to return...")
             return
 
         print()
@@ -427,8 +432,7 @@ async def run():
         working = await _probe_socks5(candidates, concurrency, timeout, existing_cache=existing_cache)
 
     except KeyboardInterrupt:
-        ui_prompts.clear_status_line()
-        print("\n[-] Scan interrupted.")
+        print("\n\n[-] Scan interrupted.")
 
     # ── 6. Results ────────────────────────────────────────────────────────────
     print()
@@ -445,8 +449,7 @@ async def run():
     else:
         print_warn("No working SOCKS5 proxies found in the scanned range.")
 
-    ui_prompts.clear_status_line()
-    ui_prompts.pause("\nPress Enter to return to main menu...", action_label="Return to Main Menu")
+    input("\nPress Enter to return to main menu...")
 
 
 if __name__ == "__main__":

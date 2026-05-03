@@ -9,11 +9,20 @@ import random
 # Updated imports to prevent namespace collision with global 'utils' libraries
 import utils.config as config
 import utils.helpers as helpers
-import cores.ui_prompts as ui_prompts
 import utils.workers as workers
 from utils.app_service import APP_SERVICE
 from utils.runtime_state import STATE
 from utils.route_service import ROUTE_SERVICE
+from utils import mmdf_ca
+from cores import mmdf_engine
+
+# Set true at proxy startup if the local CA is installed in the OS trust
+# store. MMDF MITM is skipped otherwise — leaf certs would not validate in
+# the client browser without a trusted root.
+_MMDF_READY = False
+_MMDF_PREFER_FRONT_IP = True
+_MMDF_FRONT_SNI = ""
+_MMDF_FRONT_IP = ""
 
 # ==========================================
 # DPI LOGGING TOGGLE
@@ -145,9 +154,22 @@ async def relay(reader, writer, is_client_to_remote=False, first_byte=b'', track
             elapsed = time.time() - start_time
             try:
                 if bytes_transferred == 0 and elapsed >= 1.0:
-                    ROUTE_SERVICE.mark_route_slow(route_host, route_endpoint[1], route_endpoint)
+                    ROUTE_SERVICE.mark_route_slow(
+                        route_host,
+                        route_endpoint[1],
+                        route_endpoint,
+                        reason="no-data",
+                        elapsed_ms=elapsed * 1000.0,
+                    )
                 elif first_byte_time is not None and first_byte_time > slow_threshold:
-                    ROUTE_SERVICE.mark_route_slow(route_host, route_endpoint[1], route_endpoint)
+                    ROUTE_SERVICE.mark_route_slow(
+                        route_host,
+                        route_endpoint[1],
+                        route_endpoint,
+                        reason="ttfb-slow",
+                        ttfb_ms=first_byte_time * 1000.0,
+                        elapsed_ms=elapsed * 1000.0,
+                    )
             except Exception:
                 pass
 
@@ -205,9 +227,12 @@ async def _resolve_and_connect(target_host, target_port, client_writer, use_dpi=
     forbidden = set()
 
     for attempt in range(attempts):
+        reroute_start = None
         if use_dpi:
             raw_route = config.DPI_IP if config.DPI_IP else await ROUTE_SERVICE.resolve_target(config.DPI_SNI, target_port)
         else:
+            if attempt > 0:
+                reroute_start = time.monotonic()
             raw_route = await ROUTE_SERVICE.get_routed_ip(
                 target_host,
                 target_port,
@@ -218,9 +243,19 @@ async def _resolve_and_connect(target_host, target_port, client_writer, use_dpi=
         if not actual_ip:
             return None, None, None, None
 
+        if reroute_start is not None:
+            swap_ms = (time.monotonic() - reroute_start) * 1000.0
+            ROUTE_SERVICE.record_reroute(duration_ms=swap_ms)
+            ROUTE_SERVICE.log_debug(
+                target_host,
+                f"fallback route resolved in {swap_ms:.0f}ms -> {helpers.format_ip_port(actual_ip, actual_port)}",
+            )
+
+        connect_start = time.monotonic()
         remote_reader, remote_writer = await _dpi_connect_and_tune(
             actual_ip, actual_port, client_writer, use_dpi=use_dpi
         )
+        connect_ms = (time.monotonic() - connect_start) * 1000.0
         if remote_reader is not None:
             return remote_reader, remote_writer, actual_ip, actual_port
 
@@ -230,7 +265,13 @@ async def _resolve_and_connect(target_host, target_port, client_writer, use_dpi=
 
         # Connect failed for a white-routed IP. Demote it, exclude it from
         # the next resolve, and try again.
-        ROUTE_SERVICE.mark_route_dead(target_host, target_port, (actual_ip, actual_port))
+        ROUTE_SERVICE.mark_route_dead(
+            target_host,
+            target_port,
+            (actual_ip, actual_port),
+            reason="connect-failed",
+            latency_ms=connect_ms,
+        )
         forbidden.add((actual_ip, actual_port))
         if attempt + 1 < attempts:
             print(f"[↻ REROUTE] {target_host}:{target_port} via {actual_ip}:{actual_port} failed. Re-racing without it...")
@@ -430,9 +471,18 @@ async def handle_transparent(first_byte, client_reader, client_writer):
         # Infer destination port from the local socket the client connected to
         sockname = client_writer.get_extra_info('sockname')
         target_port = int(sockname[1]) if sockname and len(sockname) > 1 else 443
-        
+
         sni, initial_data, sni_offset = await parse_tls_sni(first_byte, client_reader)
         target_host = sni if sni else config.DPI_SNI
+
+        # MMDF routing for Meet / YouTube / Google video CDN hosts.
+        if _MMDF_READY and sni and mmdf_engine.host_matches_mmdf(sni):
+            await mmdf_engine.handle_mmdf_connection(
+                client_reader, client_writer, sni, target_port,
+                prefer_front_ip=_MMDF_PREFER_FRONT_IP, prebuffered=initial_data,
+                front_sni_override=_MMDF_FRONT_SNI or None, front_ip_override=_MMDF_FRONT_IP or None,
+            )
+            return
         
         is_dpi = config.CONNECTION_MODE in ['dpi_desync', 'mixed']
 
@@ -481,7 +531,20 @@ async def handle_socks5(client_reader, client_writer):
 
         target_port = struct.unpack("!H", await client_reader.readexactly(2))[0]
         await asyncio.sleep(0)
-        
+
+        # MMDF routing — accept the SOCKS5 connect, then hand the cleartext
+        # socket to the MMDF engine which will read the ClientHello, MITM
+        # the TLS, and bridge to the front-IP.
+        if _MMDF_READY and config.is_tls_port(target_port) and mmdf_engine.host_matches_mmdf(target_host):
+            client_writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00" + struct.pack("!H", target_port))
+            await client_writer.drain()
+            await mmdf_engine.handle_mmdf_connection(
+                client_reader, client_writer, target_host, target_port,
+                prefer_front_ip=_MMDF_PREFER_FRONT_IP,
+                front_sni_override=_MMDF_FRONT_SNI or None, front_ip_override=_MMDF_FRONT_IP or None,
+            )
+            return
+
         is_dpi = (config.CONNECTION_MODE == 'dpi_desync' and config.is_tls_port(target_port))
 
         remote_reader, remote_writer, actual_ip, actual_port = await _resolve_and_connect(
@@ -554,11 +617,29 @@ async def handle_http(first_byte, client_reader, client_writer):
                         target_host = host_header.strip('[]')
                     break
 
-        if not target_host: 
+        if not target_host:
             client_writer.close()
             return
-            
+
         await asyncio.sleep(0)
+
+        # MMDF routing for HTTP CONNECT. Plain HTTP (non-TLS) cannot be MITM'd
+        # in the same shape, so we only kick in for CONNECT / TLS targets.
+        if (
+            _MMDF_READY
+            and method == 'CONNECT'
+            and config.is_tls_port(target_port)
+            and mmdf_engine.host_matches_mmdf(target_host)
+        ):
+            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await client_writer.drain()
+            await mmdf_engine.handle_mmdf_connection(
+                client_reader, client_writer, target_host, target_port,
+                prefer_front_ip=_MMDF_PREFER_FRONT_IP,
+                front_sni_override=_MMDF_FRONT_SNI or None, front_ip_override=_MMDF_FRONT_IP or None,
+            )
+            return
+
         is_dpi = (config.CONNECTION_MODE == 'dpi_desync' and config.is_tls_port(target_port))
 
         remote_reader, remote_writer, actual_ip, actual_port = await _resolve_and_connect(
@@ -634,20 +715,147 @@ async def run():
     """Main execution point for the IROpenRelayFinder server engine."""
     try:
         await _run_proxy()
+    except KeyboardInterrupt:
+        try:
+            ROUTE_SERVICE.write_debug_reports()
+        except Exception:
+            pass
     except Exception as e:
         import traceback
         traceback.print_exc()
         print(f"\n[-] FATAL CRASH in proxy engine: {e}")
-        ui_prompts.pause("Press Enter to return to main menu...", action_label="Return to Main Menu")
+        input("Press Enter to return to main menu...")
+
+def _resolve_mmdf_front_ip(front_sni, port=443):
+    try:
+        info = socket.getaddrinfo(front_sni, port, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        if info:
+            return info[0][4][0]
+    except Exception:
+        pass
+    return ""
+
+
+def _is_valid_ip(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_mmdf_runtime():
+    """Decide whether MMDF is usable and which outbound front to use.
+
+    MMDF is enabled by default on proxy start. Leaving the optional front
+    SNI/IP empty lets each target host use its matching fronting profile from
+    config.MMDF_FRONTING_PROFILES.
+    """
+    global _MMDF_READY, _MMDF_PREFER_FRONT_IP, _MMDF_FRONT_SNI, _MMDF_FRONT_IP
+
+    _MMDF_READY = False
+    _MMDF_PREFER_FRONT_IP = True
+    _MMDF_FRONT_SNI = ""
+    _MMDF_FRONT_IP = ""
+
+    try:
+        enabled_answer = input("[MMDF] Enable MMDF routing? [Y/n]: ").strip().lower()
+    except EOFError:
+        enabled_answer = ""
+    if enabled_answer in ("n", "no"):
+        config.MMDF_SNI = ""
+        config.MMDF_IP = ""
+        print("[MMDF] Disabled by user.")
+        return
+
+    if not mmdf_ca.any_backend_available():
+        print(
+            "[MMDF] Disabled — no cert backend found. "
+            "Install Python `cryptography` (pip install cryptography) "
+            "or the OpenSSL CLI (apt/brew/choco install openssl)."
+        )
+        return
+    if not mmdf_ca.ca_files_exist():
+        print("[MMDF] Disabled — local CA not initialized. Use the menu option to install the CA.")
+        return
+    installed = mmdf_ca.is_ca_installed()
+    if installed is False:
+        print("[MMDF] Disabled — local CA is not in the system / browser trust store. Use the menu to install it.")
+        return
+    if installed is None:
+        print("[MMDF] CA install state could not be verified — proceeding anyway.")
+
+    try:
+        sni_answer = input("[MMDF] Manual front SNI override [Default: per-domain profiles]: ").strip()
+    except EOFError:
+        sni_answer = ""
+    _MMDF_FRONT_SNI = sni_answer
+
+    if _MMDF_FRONT_SNI:
+        resolved_ip = _resolve_mmdf_front_ip(_MMDF_FRONT_SNI)
+        resolved_hint = f" -> {resolved_ip}" if resolved_ip else ""
+        try:
+            ip_answer = input(
+                f"[MMDF] Manual front IP override [Default: auto-resolve {_MMDF_FRONT_SNI}{resolved_hint}]: "
+            ).strip()
+        except EOFError:
+            ip_answer = ""
+
+        if ip_answer:
+            if _is_valid_ip(ip_answer):
+                _MMDF_FRONT_IP = ip_answer
+            else:
+                print(f"[MMDF] Ignoring invalid front IP: {ip_answer}")
+                _MMDF_FRONT_IP = ""
+
+    config.MMDF_SNI = _MMDF_FRONT_SNI
+    config.MMDF_IP = _MMDF_FRONT_IP
+
+    if _MMDF_FRONT_IP:
+        _MMDF_PREFER_FRONT_IP = True
+    else:
+        try:
+            answer = input(
+                "[MMDF] Resolve profile front SNIs directly for outbound IPs? [Y/n]\n"
+                "       (answer 'n' to race the white IP pool against the front SNI instead): "
+            ).strip().lower()
+        except EOFError:
+            answer = "y"
+        _MMDF_PREFER_FRONT_IP = answer not in ("n", "no")
+    _MMDF_READY = True
+
+    if _MMDF_FRONT_SNI:
+        sni_mode = _MMDF_FRONT_SNI
+        ip_mode = _MMDF_FRONT_IP if _MMDF_FRONT_IP else f"auto-resolve {_MMDF_FRONT_SNI}"
+    else:
+        sni_mode = "per-domain profiles"
+        ip_mode = "per-profile front host"
+    print(
+        f"[MMDF] Ready. Front SNI: {sni_mode}, "
+        f"Front IP: {ip_mode}, "
+        f"Outbound source: "
+        f"{'selected front IP' if _MMDF_FRONT_IP else ('front host resolved' if _MMDF_PREFER_FRONT_IP else 'white IP pool')}"
+    )
+
 
 async def _run_proxy():
     config.load_config()
-    
+
+    try:
+        debug_answer = input("[ROUTER] Enable router debug logs? [y/N]: ").strip().lower()
+    except EOFError:
+        debug_answer = ""
+    config.ROUTER_DEBUG = debug_answer in ("y", "yes")
+    if config.ROUTER_DEBUG:
+        print("[ROUTER] Debug logging enabled.")
+
     # Establish proxy start time to hide DPI logs after 10 seconds
     global PROXY_START_TIME, _LOG_DPI_ALWAYS
     PROXY_START_TIME = time.time()
     _LOG_DPI_ALWAYS = getattr(config, 'ALWAYS_SHOW_DPI_LOGS', False)  # Cache once after config loads
-    
+
+    _resolve_mmdf_runtime()
+
     # Ensure locks are bound to the running loop
     ROUTE_SERVICE.ensure_locks()
 
@@ -655,7 +863,6 @@ async def _run_proxy():
         ROUTE_SERVICE.load_ip_pool()
         
     ROUTE_SERVICE.load_routes()
-    await ROUTE_SERVICE.purge_media_wildcard_routes()
     ROUTE_SERVICE.load_banned_routes()
     
     # Dual-stack binding: try IPv4+IPv6 first, fall back to IPv4-only if IPv6 is
@@ -669,7 +876,7 @@ async def _run_proxy():
     helpers.clear_screen()
     local_ip = helpers.get_local_ip()
     print("=" * 50)
-    print(f"[*] IROpenRelayFinder LISTENING ON {config.PROXY_HOST}:{config.PROXY_PORT}")
+    print(f"[*] IROPENRELAYFINDER LISTENING ON {config.PROXY_HOST}:{config.PROXY_PORT}")
     print(f"[*] Connect your devices to: {local_ip}:{config.PROXY_PORT}")
     print("[*] Supporting MIXED mode: SOCKS5, HTTP/HTTPS, and V2Ray Transparent TLS")
     
@@ -712,6 +919,8 @@ async def _run_proxy():
     try:
         async with server:
             await server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[*] Proxy stopped by user.")
     finally:
         if config.CONNECTION_MODE in ["white_ip", "mixed"]:
             await _cancel_and_await([prewarm_task, passive_task, health_task])
@@ -720,3 +929,8 @@ async def _run_proxy():
             from cores.desync_core import dpi_injector
             if dpi_injector:
                 dpi_injector.running = False
+
+        try:
+            ROUTE_SERVICE.write_debug_reports()
+        except Exception:
+            pass

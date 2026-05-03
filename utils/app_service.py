@@ -113,6 +113,14 @@ class AppService:
         if ip is not None:
             config.DPI_IP = ip
 
+    def set_mmdf_target(self, sni=None, ip=None, persist=True):
+        if sni is not None:
+            config.MMDF_SNI = sni
+        if ip is not None:
+            config.MMDF_IP = ip
+        if persist:
+            config.save_config()
+
     def toggle_dpi_fragmentation(self):
         config.DPI_FRAGMENTATION = not getattr(config, 'DPI_FRAGMENTATION', False)
         config.save_config()

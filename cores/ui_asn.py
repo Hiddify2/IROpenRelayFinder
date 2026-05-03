@@ -138,18 +138,15 @@ def menu_search_asn():
         print(f"\n--- Page {page + 1}/{total_pages} ---")
         print(ui_layout.color_text(" Commands", "nav"))
         print(" [1,2,5-8] Toggle ASN selection")
-        print(" [/]        Open search bar")
-        print("   text     Substring search")
-        print("   *pat*    Wildcard search")
-        print("   regex:   Regex search (example: regex:^AS\\d+(mobile|.*mci))")
-        print("   ^pat$    Regex anchors (example: ^AS58224)")
-        print(" [n]        Next page")
-        print(" [p]        Previous page")
+        print(" [/text]    Search (substring match)")
+        print(" [/*pat*]   Wildcard search")
+        print(" [/regex:]  Regex search (example: /regex:^AS\\d+(mobile|.*mci))")
+        print(" [/^pat$]   Regex anchors (example: /^AS58224)")
+        print(" [n]/[p]    Next/Previous page")
         print(" [all]      Select all current matches")
         print(" [clear]    Clear all selections")
         print(" [d]        Done and queue subnets")
         print(" [0]        Cancel")
-        print(ui_layout.color_text(" Hotkeys: [/] search  [n] next  [p] prev  [all] all  [clear] clear  [d] done  [0] back", "dim"))
 
         cmd = input("\nAction: ").strip().lower()
         if not cmd:
@@ -174,11 +171,6 @@ def menu_search_asn():
                 time.sleep(1)
                 continue
             break
-        if cmd == '/':
-            query_raw = input("Search query (empty = all): ").strip()
-            query = query_raw.lower() if query_raw else "*"
-            page = 0
-            continue
         if cmd.startswith('/'):
             query = cmd[1:].strip().lower() or "*"
             page = 0
@@ -235,11 +227,9 @@ def menu_browse_asn_db():
         print(f"\n--- Page {page + 1}/{total_pages} ---")
         print(ui_layout.color_text(" Commands", "nav"))
         print(" [1,2...]    View ASN subnets")
-        print(" [/]         Open search bar")
-        print(" [n]         Next page")
-        print(" [p]         Previous page")
+        print(" [/text]     Search")
+        print(" [n]/[p]     Next/Previous page")
         print(" [0]         Back")
-        print(ui_layout.color_text(" Hotkeys: [/] search  [n] next  [p] prev  [0] back", "dim"))
 
         cmd = input("\nAction: ").strip().lower()
         if not cmd:
@@ -251,11 +241,6 @@ def menu_browse_asn_db():
             continue
         if cmd == 'p':
             page -= 1
-            continue
-        if cmd == '/':
-            query_raw = input("Search query (empty = all): ").strip()
-            query = query_raw.lower() if query_raw else "*"
-            page = 0
             continue
         if cmd.startswith('/'):
             query = cmd[1:].strip().lower() or "*"
@@ -296,7 +281,6 @@ def menu_browse_asn_db():
 
             print(f"\n--- Page {sub_page + 1}/{sub_total_pages} ---")
             print(" Commands: [n] Next  [p] Previous  [0] Back")
-            print(ui_layout.color_text(" Hotkeys: [n] next  [p] prev  [0] back", "dim"))
 
             sub_cmd = input("\nAction: ").strip().lower()
             if sub_cmd == 'n' and sub_page < sub_total_pages - 1:

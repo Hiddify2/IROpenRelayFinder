@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import random
+import select
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -18,35 +20,31 @@ from utils.scan_service import SCAN_SERVICE
 
 import cores.ui_asn as ui_asn
 import cores.ui_layout as ui_layout
-import cores.ui_prompts as ui_prompts
 
 
 def prompt_target_ports():
-    ui_layout.draw_header(ui_mode="white")
-    current_ports = ", ".join(str(p) for p in config.TARGET_PORTS)
+    default_ports = ", ".join(str(p) for p in config.DEFAULT_TARGET_PORTS)
+    last_ports = ", ".join(str(p) for p in config.LAST_TARGET_PORTS)
     ui_layout.print_section("TARGET PORTS")
-    print(f" [1] Use configured ports ({current_ports})")
+    print(f" [1] Use default ports ({default_ports}) [Default]")
     print(" [2] Enter custom ports")
-    saved_mode = str(ui_prompts.get_pref("white_scan.port_mode", "1")).strip().lower()
-    if saved_mode not in {"1", "2"}:
-        saved_mode = "1"
-    choice = input(f"\nPort mode [Default {saved_mode}, or type ports directly]: ").strip().lower()
+    print(f" [3] Use last used profile ({last_ports})")
+    choice = input("\nChoice (press Enter for default, or enter ports directly): ").strip()
     
-    if not choice:
-        choice = saved_mode
-
-    if choice == "1":
-        ui_prompts.set_pref("white_scan.port_mode", "1")
-        selected_ports = list(config.TARGET_PORTS)
+    if not choice or choice == "1":
+        selected_ports = list(config.DEFAULT_TARGET_PORTS)
     elif choice == "2":
-        ui_prompts.set_pref("white_scan.port_mode", "2")
         raw_ports = input("Enter ports (comma or space separated, e.g. 443,2053,8443): ").strip()
-        selected_ports = helpers.parse_port_list(raw_ports, fallback_ports=config.TARGET_PORTS)
+        selected_ports = helpers.parse_port_list(raw_ports, fallback_ports=config.DEFAULT_TARGET_PORTS)
+    elif choice == "3":
+        selected_ports = list(config.LAST_TARGET_PORTS)
     else:
-        ui_prompts.set_pref("white_scan.port_mode", "custom")
-        selected_ports = helpers.parse_port_list(choice, fallback_ports=config.TARGET_PORTS)
+        # Direct port input (e.g., "443, 8443", "80 443 8080")
+        selected_ports = helpers.parse_port_list(choice, fallback_ports=config.DEFAULT_TARGET_PORTS)
+        if not selected_ports:
+            selected_ports = list(config.DEFAULT_TARGET_PORTS)
     
-    config.set_target_ports(selected_ports)
+    config.set_target_ports(selected_ports, persist=True, remember=True)
     return selected_ports
 
 
@@ -117,20 +115,101 @@ def build_scan_endpoints(raw_items, base_ports, strip_explicit_ports=False):
     return exact_endpoints, expanded_targets, preflight_ips, merged_ports
 
 
+def _start_scan_pause_listener(pause_controller):
+    stop_event = threading.Event()
+
+    def _handle_cmd(cmd: str) -> None:
+        if cmd in ("p", "pause"):
+            pause_controller.pause("user")
+            ui_layout.print_warn("Scan paused. Press 'r' to resume.")
+        elif cmd in ("r", "resume"):
+            pause_controller.resume("user")
+            ui_layout.print_ok("\nScan resumed.")
+
+    def _listen_line():
+        while not stop_event.is_set():
+            try:
+                line = sys.stdin.readline()
+            except Exception:
+                time.sleep(0.1)
+                continue
+            if not line:
+                time.sleep(0.1)
+                continue
+            _handle_cmd(line.strip().lower())
+
+    def _listen_keypress():
+        fd = sys.stdin.fileno()
+        try:
+            import termios
+            import tty
+        except Exception:
+            _listen_line()
+            return
+
+        try:
+            old_settings = termios.tcgetattr(fd)
+        except Exception:
+            _listen_line()
+            return
+
+        try:
+            tty.setcbreak(fd)
+            while not stop_event.is_set():
+                try:
+                    ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                except Exception:
+                    continue
+                if not ready:
+                    continue
+                try:
+                    ch = sys.stdin.read(1)
+                except Exception:
+                    continue
+                if not ch:
+                    continue
+                _handle_cmd(ch.strip().lower())
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+    def _listen_windows():
+        try:
+            import msvcrt
+        except Exception:
+            _listen_line()
+            return
+        while not stop_event.is_set():
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                _handle_cmd(ch.strip().lower())
+            else:
+                time.sleep(0.1)
+
+    def _listen():
+        if sys.platform == "win32":
+            _listen_windows()
+        elif sys.stdin.isatty():
+            _listen_keypress()
+        else:
+            _listen_line()
+
+    threading.Thread(target=_listen, daemon=True).start()
+    return stop_event
+
+
 def menu_scan():
     ui_layout.draw_header(ui_mode="white")
-    choice = ui_prompts.menu_choice(
-        "SCAN SOURCE",
-        [
-            ("1", "Load IPs/CIDRs/ASNs from text file", None),
-            ("2", "Paste IPs/CIDRs/ASNs manually", None),
-            ("3", "Use Permanent White IP cache", None),
-            ("4", "Select from IranASN database", None),
-            ("0", "Back", None),
-        ],
-        default="1",
-        remember_key="white_scan.source",
-    )
+    ui_layout.print_section("SCAN SOURCE")
+    print(" [1] Load IPs/CIDRs/ASNs from text file")
+    print(" [2] Paste IPs/CIDRs/ASNs manually")
+    print(" [3] Use Permanent White IP cache")
+    print(" [4] Mine IPs from Cloudflare CNAMEs")
+    print(" [5] Select from IranASN database")
+    print(" [0] Back")
+    choice = input("\nChoice: ").strip()
 
     raw_targets = []
     if choice == "1":
@@ -141,7 +220,7 @@ def menu_scan():
                     if line.strip():
                         raw_targets.append(line.strip())
         else:
-            ui_prompts.pause(ui_layout.color_text("[-] File not found. Press Enter to return...", "err"), action_label="Return to Main Menu")
+            input(ui_layout.color_text("[-] File not found. Press Enter to return...", "err"))
             return
     elif choice == "2":
         print("Paste your IPs/CIDRs/ASNs (Press Enter on an empty line to finish):")
@@ -153,18 +232,45 @@ def menu_scan():
     elif choice == "3":
         cached_ips = helpers.load_white_cache()
         if not cached_ips:
-            ui_prompts.pause(ui_layout.color_text("[-] White IPs Cache is empty. Press Enter to return...", "err"), action_label="Return to Main Menu")
+            input(ui_layout.color_text("[-] White IPs Cache is empty. Press Enter to return...", "err"))
             return
         ui_layout.print_hint(f"Queued {len(cached_ips)} active cached endpoints.")
         raw_targets = list(cached_ips)
     elif choice == "4":
+        import socket
+
+        rounds_str = input("[?] DNS resolution rounds [Default 5]: ").strip()
+        rounds = int(rounds_str) if rounds_str.isdigit() else 5
+        delay_str = input("[?] Delay between rounds in seconds [Default 2]: ").strip()
+        delay = int(delay_str) if delay_str.isdigit() else 2
+
+        mined_ips = set()
+        ui_layout.print_hint(f"Mining {len(config.CLOUDFLARE_CNAME_DOMAINS)} Cloudflare domains over {rounds} rounds...")
+        for r in range(rounds):
+            sys.stdout.write(f"\r[*] Round {r+1}/{rounds} - Discovered IPs so far: {len(mined_ips)}     ")
+            sys.stdout.flush()
+            random.shuffle(config.CLOUDFLARE_CNAME_DOMAINS)
+            for domain in config.CLOUDFLARE_CNAME_DOMAINS:
+                try:
+                    _, _, ip_list = socket.gethostbyname_ex(domain)
+                    mined_ips.update(ip_list)
+                except Exception:
+                    pass
+            if r < rounds - 1:
+                time.sleep(delay)
+
+        print(f"\r{ui_layout.color_text('[*] Mining complete!', 'dim')} Discovered {len(mined_ips)} unique IPs.            \n")
+
+        if not mined_ips:
+            input(ui_layout.color_text("[-] No IPs discovered. Press Enter to return...", "err"))
+            return
+        raw_targets = list(mined_ips)
+    elif choice == "5":
         subnets = ui_asn.menu_search_asn()
         if not subnets:
-            ui_prompts.pause("Press Enter to return...", action_label="Return to Main Menu")
+            input("Press Enter to return...")
             return
         raw_targets.extend(subnets)
-    elif choice == "0":
-        return
     else:
         return
 
@@ -180,36 +286,25 @@ def menu_scan():
             expanded_items.extend(asn_engine.expand_target(t))
 
     if not expanded_items:
-        ui_prompts.pause(ui_layout.color_text("[-] No valid IPs to scan. Press Enter to return...", "err"), action_label="Return to Main Menu")
-        return
-
-    expanded_items, dropped = asn_engine.filter_to_iranian(expanded_items)
-    if dropped:
-        ui_layout.print_warn(f"{dropped} non-Iranian IP(s) were dropped (not found in IranASN database).")
-    if not expanded_items:
-        ui_prompts.pause(ui_layout.color_text("[-] No Iranian IPs remain after filtering. Press Enter to return...", "err"), action_label="Return to Main Menu")
+        input(ui_layout.color_text("[-] No valid IPs to scan. Press Enter to return...", "err"))
         return
 
     selected_ports = prompt_target_ports()
     has_explicit_ports = any(_has_explicit_port(item) for item in expanded_items)
     strip_explicit_ports = False
     if has_explicit_ports:
-        ui_layout.draw_header(ui_mode="white")
-        ui_layout.print_section("EXPLICIT PORT TARGETS")
-        strip_explicit_ports = ui_prompts.prompt_yes_no(
-            "[?] Some targets include explicit ports. Strip them and scan only selected target ports",
-            default=False,
-        )
+        strip_choice = input("[?] Some targets include explicit ports. Strip them and scan only the selected target ports instead? (y/N): ").strip().lower()
+        strip_explicit_ports = strip_choice == 'y'
 
     exact_endpoints, endpoints, preflight_ips, merged_ports = build_scan_endpoints(
         expanded_items,
         selected_ports,
         strip_explicit_ports=strip_explicit_ports,
     )
-    config.set_target_ports(merged_ports)
+    config.set_target_ports(merged_ports, persist=True, remember=True)
 
     if not endpoints:
-        ui_prompts.pause(ui_layout.color_text("[-] No endpoints derived from provided IPs. Press Enter to return...", "err"), action_label="Return to Main Menu")
+        input(ui_layout.color_text("[-] No endpoints derived from provided IPs. Press Enter to return...", "err"))
         return
 
     base_ips = list(dict.fromkeys(preflight_ips))
@@ -222,28 +317,23 @@ def menu_scan():
     has_masscan = shutil.which("masscan") is not None
     has_nmap = shutil.which("nmap") is not None
 
-    selected_tool = str(ui_prompts.get_pref("white_scan.method", "asyncio")).strip().lower()
-    if selected_tool not in {"asyncio", "masscan", "nmap"}:
-        selected_tool = "asyncio"
+    selected_tool = "normal"
     is_debug_mode = False
-    options = {"1": "asyncio"}
+    options = {"1": "normal"}
     opt_num = 2
     if has_masscan:
         options[str(opt_num)] = "masscan"
         opt_num += 1
     if has_nmap:
         options[str(opt_num)] = "nmap"
-    if selected_tool == "masscan" and not has_masscan:
-        selected_tool = "asyncio"
-    if selected_tool == "nmap" and not has_nmap:
-        selected_tool = "asyncio"
 
     while True:
         ui_layout.draw_header(ui_mode="white")
         ui_layout.print_section("SCAN METHOD")
         ui_layout.print_hint(f"Target IPs queued: {len(base_ips)}")
 
-        print(f"\n [1] Normal scan (asyncio, concurrency={config.MAX_CONCURRENT_SCANS})")
+        print("\n [1] Normal scan (Python asyncio)")
+        print(f"     Accuracy-first, concurrency={config.MAX_CONCURRENT_SCANS}")
 
         if has_masscan:
             mass_option_num = [k for k, v in options.items() if v == "masscan"][0]
@@ -269,8 +359,9 @@ def menu_scan():
         print(" [s] Start scan with current settings")
         print(" [0] Back")
 
-        method_choice = input("\nAction [Default s] ([s] start, [d] debug, [1..] method, [0] back): ").strip().lower()
+        method_choice = input("\nAction (press Enter to start, [d] toggle debug, [0] back): ").strip().lower()
         if not method_choice:
+            # Empty input = start scan with current settings
             break
         if method_choice == "0":
             return
@@ -278,7 +369,6 @@ def menu_scan():
             is_debug_mode = not is_debug_mode
             continue
         if method_choice == "s":
-            ui_prompts.set_pref("white_scan.method", selected_tool)
             break
         selected_tool = options.get(method_choice, selected_tool)
 
@@ -287,19 +377,12 @@ def menu_scan():
     if selected_tool == "asyncio":
         ui_layout.print_section("CONCURRENCY")
         print(f" Current setting: {config.MAX_CONCURRENT_SCANS} concurrent connections")
-        config.MAX_CONCURRENT_SCANS = ui_prompts.prompt_int(
-            "[?] Concurrent connections for this scan",
-            config.MAX_CONCURRENT_SCANS,
-            min_value=1,
-            remember_key="white_scan.asyncio_concurrency",
-        )
+        conc_s = input(f"[?] Concurrent connections for this scan [Default {config.MAX_CONCURRENT_SCANS}]: ").strip()
+        if conc_s.isdigit() and int(conc_s) > 0:
+            config.MAX_CONCURRENT_SCANS = int(conc_s)
 
     ui_layout.print_section("SCAN OPTIONS")
-    is_cyclic = ui_prompts.prompt_yes_no(
-        "[?] Run cyclic continuous scan",
-        default=False,
-        remember_key="white_scan.cyclic",
-    )
+    is_cyclic = input("[?] Run cyclic continuous scan? (y/N): ").strip().lower() == 'y'
 
     preflighted_targets = [(ip, port) for ip in base_ips for port in config.TARGET_PORTS]
     all_successful_results = {}
@@ -359,20 +442,35 @@ def menu_scan():
                 round_num += 1
                 continue
             else:
-                ui_prompts.pause(ui_layout.color_text("[-] No IPs survived pre-flight or scan cancelled. Press Enter to return...", "err"), action_label="Return to Main Menu")
+                input(ui_layout.color_text("[-] No IPs survived pre-flight or scan cancelled. Press Enter to return...", "err"))
                 return
 
         print(f"[*] Target IPs loaded for TLS Verification: {len(current_targets)}")
-        print("[!] Press Ctrl+C at any time to STOP the scan and save current results.\n")
+        print("[!] Press Ctrl+C at any time to STOP the scan and save current results.")
+        ui_layout.print_hint("Press 'p' to pause, 'r' to resume while the scan runs.")
+        print()
 
         successful_results = []
         interrupted = False
+        pause_controller = SCAN_SERVICE.new_pause_controller()
+        pause_stop = _start_scan_pause_listener(pause_controller)
         try:
-            asyncio.run(SCAN_SERVICE.run_mass_scan(current_targets, config.DEFAULT_DOMAINS, successful_results, skip_tcp=skip_tcp, deep_scan=is_debug_mode))
+            asyncio.run(
+                SCAN_SERVICE.run_mass_scan(
+                    current_targets,
+                    config.DEFAULT_DOMAINS,
+                    successful_results,
+                    skip_tcp=skip_tcp,
+                    deep_scan=is_debug_mode,
+                    pause_controller=pause_controller,
+                )
+            )
         except KeyboardInterrupt:
-            ui_prompts.clear_status_line()
-            print("\n[!] Scan interrupted by user. Finalizing saved IPs...")
+            print("\n\n[!] Scan INTERRUPTED by user. Finalizing saved IPs...")
             interrupted = True
+        finally:
+            pause_stop.set()
+            pause_controller.resume()
 
         for r in successful_results:
             port = int(r.get('port', config.primary_target_port()))
@@ -429,26 +527,19 @@ def menu_scan():
             time.sleep(5)
             round_num += 1
         except KeyboardInterrupt:
-            ui_prompts.clear_status_line()
-            print("\n[!] Scan interrupted by user. Exiting cyclic loop...")
+            print("\n\n[!] Scan INTERRUPTED by user. Exiting cyclic loop...")
             break
 
-        ui_prompts.clear_status_line()
-        ui_prompts.pause("\nPress Enter to return to main menu...", action_label="Return to Main Menu")
+    input("\nPress Enter to return to main menu...")
 
 
 def menu_instant_connect():
     ui_layout.draw_header(ui_mode="white")
-    choice = ui_prompts.menu_choice(
-        "INSTANT CONNECT",
-        [
-            ("1", "Load IPs from text file", None),
-            ("2", "Paste IPs manually", None),
-            ("0", "Back", None),
-        ],
-        default="1",
-        remember_key="instant_connect.source",
-    )
+    ui_layout.print_section("INSTANT CONNECT")
+    print(" [1] Load IPs from text file")
+    print(" [2] Paste IPs manually")
+    print(" [0] Back")
+    choice = input("\nChoice: ").strip()
 
     raw_items = []
     if choice == "1":
@@ -459,7 +550,7 @@ def menu_instant_connect():
                     if line.strip():
                         raw_items.extend(asn_engine.expand_target(line.strip()))
         else:
-            ui_prompts.pause(ui_layout.color_text("[-] File not found. Press Enter to return...", "err"), action_label="Return to Main Menu")
+            input(ui_layout.color_text("[-] File not found. Press Enter to return...", "err"))
             return
     elif choice == "2":
         print("Paste your IPs/CIDRs/ASNs (Press Enter on an empty line to finish):")
@@ -468,21 +559,12 @@ def menu_instant_connect():
             if not line:
                 break
             raw_items.extend(asn_engine.expand_target(line))
-    elif choice == "0":
-        return
     else:
         return
 
     raw_items = list(dict.fromkeys(raw_items))
     if not raw_items:
-        ui_prompts.pause(ui_layout.color_text("[-] No valid IPs parsed. Press Enter to return...", "err"), action_label="Return to Main Menu")
-        return
-
-    raw_items, dropped = asn_engine.filter_to_iranian(raw_items)
-    if dropped:
-        ui_layout.print_warn(f"{dropped} non-Iranian IP(s) were dropped (not found in IranASN database).")
-    if not raw_items:
-        ui_prompts.pause(ui_layout.color_text("[-] No Iranian IPs remain after filtering. Press Enter to return...", "err"), action_label="Return to Main Menu")
+        input(ui_layout.color_text("[-] No valid IPs parsed. Press Enter to return...", "err"))
         return
 
     exact_endpoints, endpoints, _, _ = build_scan_endpoints(
@@ -491,7 +573,7 @@ def menu_instant_connect():
         strip_explicit_ports=False,
     )
     if not endpoints:
-        ui_prompts.pause(ui_layout.color_text("[-] No endpoints derived from provided IPs. Press Enter to return...", "err"), action_label="Return to Main Menu")
+        input(ui_layout.color_text("[-] No endpoints derived from provided IPs. Press Enter to return...", "err"))
         return
 
     random.shuffle(endpoints)
@@ -499,6 +581,8 @@ def menu_instant_connect():
 
     successful_results = []
     interrupted = False
+    pause_controller = SCAN_SERVICE.new_pause_controller()
+    pause_stop = _start_scan_pause_listener(pause_controller)
     try:
         asyncio.run(
             SCAN_SERVICE.run_mass_scan(
@@ -507,14 +591,18 @@ def menu_instant_connect():
                 successful_results,
                 skip_tcp=False,
                 deep_scan=False,
+                pause_controller=pause_controller,
             )
         )
     except KeyboardInterrupt:
         print("\n\n[!] Instant-connect verification interrupted by user. Using collected results...")
         interrupted = True
+    finally:
+        pause_stop.set()
+        pause_controller.resume()
 
     if not successful_results:
-        ui_prompts.pause(ui_layout.color_text("[-] No usable IP:Port pairs found. Press Enter to return...", "err"), action_label="Return to Main Menu")
+        input(ui_layout.color_text("[-] No usable IP:Port pairs found. Press Enter to return...", "err"))
         return
 
     best_by_endpoint = {}
@@ -556,7 +644,7 @@ def menu_instant_connect():
     newly_cached = helpers.save_to_white_cache(usable_eps)
     if newly_cached > 0:
         print(f"[+] Added {newly_cached} IPs to the permanent White IP cache.")
-    ui_prompts.pause("Press Enter to return to main menu...", action_label="Return to Main Menu")
+    input("Press Enter to return to main menu...")
 
 
 def menu_manage_pool():
@@ -585,4 +673,4 @@ def menu_manage_pool():
                 pass
     else:
         ui_layout.print_err("No scan files found. Run a scan first.")
-    ui_prompts.pause("\nPress Enter to return...", action_label="Return to Main Menu")
+    input("\nPress Enter to return...")

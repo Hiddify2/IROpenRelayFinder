@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Publishing script for IROpenRelayFinder releases.
+Publishing script for white-proxy releases.
 - Runs smoke tests
 - Bumps app version based on git history
 - Creates a release zip file
@@ -205,24 +205,6 @@ def get_exclude_patterns():
         "settings.local.json",
         "paused.conf",
 
-        # Runtime-generated data (cache/output files)
-        "white_routes.txt",
-        "failed_routes.txt",
-        "banned_routes.txt",
-        "white_ips_cache.txt",
-        "cloudflare_workers_ips.txt",
-        "nmap_targets.txt",
-        "clean_snis.txt",
-        "desync_pairs.json",
-        "socks5_cache.txt",
-        "socks5_proxies.txt",
-        "scan_*.json",
-        "scan_cyclic_continuous.json",
-        "masscan_targets_*",
-        "masscan_results*",
-        "nmap_results_*",
-        "nmap_targets_*",
-
         # Temp and archive directories
         "tmp",
         "cyclic_archives",
@@ -232,25 +214,27 @@ def get_exclude_patterns():
     }
 
 
+def _is_under_data_dir(rel_path):
+    """True if rel_path is the data/ directory or anything inside it."""
+    parts = rel_path.replace("\\", "/").split("/")
+    return parts and parts[0] == "data"
+
+
 def should_exclude(file_path, root_dir, exclude_patterns):
     """Check if a file should be excluded from the release."""
     rel_path = os.path.relpath(file_path, root_dir)
-    
-    # Always exclude scanner_config.json from exclusion (special case)
-    if rel_path == "data/scanner_config.json" or os.path.basename(file_path) == "scanner_config.json":
-        return False
-    
-    # Check exclusion patterns
+
+    # The entire data/ directory is generated at runtime — never ship it.
+    if _is_under_data_dir(rel_path):
+        return True
+
+    # Check exclusion patterns (wildcard / substring / extension matches)
     for pattern in exclude_patterns:
-        if pattern.startswith("scan_"):
-            # Handle wildcard patterns
-            if os.path.basename(file_path).startswith("scan_") and file_path.endswith(".json"):
-                return True
-        elif os.path.basename(file_path) == pattern or os.path.basename(file_path).endswith(pattern):
+        if os.path.basename(file_path) == pattern or os.path.basename(file_path).endswith(pattern):
             return True
-        elif pattern in rel_path:
+        if pattern in rel_path:
             return True
-    
+
     # Exclude .pyc / .log / .zip files
     if file_path.endswith((".pyc", ".log", ".zip")):
         return True
@@ -266,7 +250,7 @@ def create_release_zip(root_dir, version):
     os.makedirs(releases_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_filename = f"irorf_v{version}_{timestamp}.zip"
+    zip_filename = f"white-proxy_v{version}_{timestamp}.zip"
     zip_path = os.path.join(releases_dir, zip_filename)
     
     exclude_patterns = get_exclude_patterns()
@@ -330,7 +314,7 @@ def main():
     root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     
     print("=" * 60)
-    print("IROpenRelayFinder - PUBLISHING SCRIPT")
+    print("IROPENRELAYFINDER - PUBLISHING SCRIPT")
     print("=" * 60)
     
     # Step 1: Run smoke tests
