@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Publishing script for white-proxy releases.
+Publishing script for OpenRelay releases.
 - Runs smoke tests
 - Bumps app version based on git history
 - Creates a release zip file
@@ -250,7 +250,7 @@ def create_release_zip(root_dir, version):
     os.makedirs(releases_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    zip_filename = f"white-proxy_v{version}_{timestamp}.zip"
+    zip_filename = f"OpenRelay_v{version}_{timestamp}.zip"
     zip_path = os.path.join(releases_dir, zip_filename)
     
     exclude_patterns = get_exclude_patterns()
