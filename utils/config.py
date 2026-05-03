@@ -9,7 +9,7 @@ from utils import data_store
 # ==========================================
 # GENERAL CONFIGURATION
 # ==========================================
-VERSION = "9.2.1"
+VERSION = "2.0.1"
 PROXY_HOST = '0.0.0.0'
 PROXY_PORT = 7080
 
